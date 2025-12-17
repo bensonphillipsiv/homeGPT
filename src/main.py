@@ -7,7 +7,7 @@ import signal
 import os
 
 from config import load_config, setup_logging
-from audio import AudioConfig, Audio, OpenWakeWordDetector, WebRTCVADDetector, OpenWhisperASR
+from audio import AudioConfig, Audio, OpenWakeWordDetector, WebRTCVADDetector, OpenWhisperASR, PiperTTS, PiperTTSConfig
 from assistant import Assistant, AssistantConfig
 from agent import AgentConfig, HomeAgent, MCPServerConfig
 
@@ -49,6 +49,13 @@ async def main():
 
     asr = OpenWhisperASR()
 
+    # Initialize TTS if enabled
+    tts = None
+    if config.tts_enabled:
+        tts_config = PiperTTSConfig(model_path=config.tts_model_path)
+        tts = PiperTTS(tts_config)
+        logger.info(f"TTS enabled: {config.tts_model_path}")
+
     # Build MCP server configs
     mcp_servers = []
     for mcp_module in config.mcps:
@@ -82,7 +89,8 @@ async def main():
         wakeword=wakeword,
         vad=vad,
         asr=asr,
-        agent=agent
+        agent=agent,
+        tts=tts,
     )
     assistant = Assistant(assistant_config)
     

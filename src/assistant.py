@@ -5,7 +5,7 @@ import time
 import struct
 from dataclasses import dataclass
 
-from audio import Audio, OpenWakeWordDetector, WebRTCVADDetector, OpenWhisperASR
+from audio import Audio, OpenWakeWordDetector, WebRTCVADDetector, OpenWhisperASR, PiperTTS
 from agent import HomeAgent
 
 logger = logging.getLogger(__name__)
@@ -19,6 +19,7 @@ class AssistantConfig:
     vad: WebRTCVADDetector
     asr: OpenWhisperASR
     agent: HomeAgent
+    tts: PiperTTS | None = None  # Optional TTS for voice output
     
     # Timing settings
     vad_delay_ms: int = 800  # Delay after wake word before listening
@@ -36,6 +37,7 @@ class Assistant:
         self.vad = config.vad
         self.asr = config.asr
         self.agent = config.agent
+        self.tts = config.tts
         
         self._running = False
     
@@ -62,7 +64,8 @@ class Assistant:
                 elapsed_ms = (time.time() - start_time) * 1000
                 logger.info(f"Agent Response ({elapsed_ms:.0f}ms): {response}")
 
-                # await self.speak(response)
+                if self.tts:
+                    self.tts.speak(response, self.audio)
                 
         finally:
             await self.audio.close()

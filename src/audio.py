@@ -8,9 +8,9 @@ import socket
 import struct
 import time
 from dataclasses import dataclass
-from typing import AsyncIterator
-from faster_whisper import WhisperModel
 
+from faster_whisper import WhisperModel
+from piper.voice import PiperVoice
 import numpy as np
 import webrtcvad
 from openwakeword.model import Model as OWWModel
@@ -29,7 +29,6 @@ class AudioConfig:
     device_ip: str = "192.168.1.132"
     listener_port: int = 4712
     speaker_port: int = 4713
-
 
 class LocalAudio:
     """Local audio using PyAudio"""
@@ -75,7 +74,6 @@ class LocalAudio:
             exception_on_overflow=False
         )
     
-    
     async def write(self, audio: bytes) -> None:
         """Write audio to output"""
         if self.output_stream is None:
@@ -93,7 +91,6 @@ class LocalAudio:
         if self.pa:
             self.pa.terminate()
         logger.info("Local audio closed")
-
 
 class Audio:
     """Unified audio interface for local or remote audio"""
@@ -125,9 +122,14 @@ class Audio:
             raise RuntimeError("Audio not connected")
         await self._backend.write(audio)
 
+    def write_sync(self, audio: bytes) -> None:
+        """Write audio to speakers (synchronous)"""
+        if self._backend is None:
+            raise RuntimeError("Audio not connected")
+        self._backend.output_stream.write(audio)
+
     async def play_alert(self):
         """Play wake word acknowledgment sound"""
-        import numpy as np
         
         duration = 0.15
         t = np.linspace(0, duration, int(self.config.sample_rate * duration), endpoint=False)
@@ -158,7 +160,6 @@ class OpenWakeWordConfig:
     sample_rate: int = 16000
     frame_size_ms: int = 80  # OpenWakeWord needs 80ms frames
 
-
 class OpenWakeWordDetector:
     """
     OpenWakeWord implementation.
@@ -175,7 +176,6 @@ class OpenWakeWordDetector:
         # Get available keywords
         self._keywords = list(self._model.models.keys())
         logger.info(f"Wake word detector initialized with keywords: {self._keywords}")
-    
     
     def process_frame(self, audio: bytes):
         """
@@ -221,7 +221,6 @@ class WebRTCVADConfig:
     SAMPLES_PER_20MS = SAMPLE_RATE * 20 // 1000  # 320 samples
     BYTES_PER_20MS = SAMPLES_PER_20MS * 2  # 640 bytes (16-bit audio)
 
-
 class WebRTCVADDetector:
     """
     Adapter: WebRTC VAD implementation of VADDetector.
@@ -263,7 +262,6 @@ class OpenWhisperASRConfig:
     device: str = "cpu"
     compute_type: str = "int8"
 
-
 class OpenWhisperASR:
     """
     Adapter: WebRTC VAD implementation of VADDetector.
@@ -285,3 +283,51 @@ class OpenWhisperASR:
 
 
 # ========== TTS ==========
+@dataclass
+class PiperTTSConfig:
+    """Configuration for Piper TTS"""
+    model_path: str = "./models/lessac_low_model.onnx"
+
+class PiperTTS:
+    """
+    Piper TTS with streaming audio output via PyAudio.
+    
+    Usage:
+        tts = PiperTTS(PiperTTSConfig(model_path="./models/en_US-lessac-medium.onnx"))
+        await tts.speak("Hello world", audio)
+    """
+    
+    def __init__(self, config: PiperTTSConfig | None = None):
+        self.config = config or PiperTTSConfig()
+        self._voice = PiperVoice.load(self.config.model_path)
+    
+    def synthesize_stream(self, text: str):
+        """
+        Generator that yields audio chunks as they're synthesized.
+        
+        Args:
+            text: Text to synthesize
+            
+        Yields:
+            bytes: Raw PCM audio chunks (16-bit signed, mono)
+        """
+        for chunk in self._voice.synthesize(text):
+            yield chunk.audio_int16_bytes
+    
+    def speak(self, text: str, audio: "Audio") -> None:
+        """
+        Speak text through the audio output in streaming mode.
+        
+        Args:
+            text: Text to speak
+            audio: Audio instance for output
+        """
+        if not text.strip():
+            return
+        
+        logger.info(f"TTS speaking: {text[:50]}...")
+        
+        for audio_bytes in self.synthesize_stream(text):
+            audio.write_sync(audio_bytes)
+        
+        logger.info("TTS finished speaking")

@@ -28,6 +28,7 @@ class Config:
     whisper_model: str
     whisper_device: str
     tts_model_path: str
+    tts_enabled: bool
     
     # Agent settings
     model_provider: Literal["openai", "bedrock"]
@@ -62,7 +63,8 @@ def load_config() -> Config:
         # Models
         whisper_model=os.getenv("WHISPER_MODEL", "base.en"),
         whisper_device=os.getenv("WHISPER_DEVICE", "cpu"),
-        tts_model_path=os.getenv("TTS_MODEL_PATH", "./models/lessac_low.onnx"),
+        tts_model_path=os.getenv("TTS_MODEL_PATH", "./models/lessac_low_model.onnx"),
+        tts_enabled=os.getenv("TTS_ENABLED", "true").lower() == "true",
         
         # Agent - Model Provider
         model_provider=os.getenv("MODEL_PROVIDER", "openai"),  # "openai" or "bedrock"
