@@ -30,8 +30,11 @@ class Config:
     tts_model_path: str
     
     # Agent settings
-    openai_api_key: str
+    model_provider: Literal["openai", "bedrock"]
+    openai_api_key: str | None
     openai_model: str
+    bedrock_model: str
+    bedrock_region: str
     
     # MCP servers
     mcps: list[str]
@@ -61,12 +64,19 @@ def load_config() -> Config:
         whisper_device=os.getenv("WHISPER_DEVICE", "cpu"),
         tts_model_path=os.getenv("TTS_MODEL_PATH", "./models/lessac_low.onnx"),
         
-        # Agent
-        openai_api_key=os.getenv("OPENAI_API_KEY"),  # Required - raises if missing
-        openai_model=os.getenv("GPT_MODEL", "gpt-4o-mini"),
+        # Agent - Model Provider
+        model_provider=os.getenv("MODEL_PROVIDER", "openai"),  # "openai" or "bedrock"
+        
+        # OpenAI settings
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        
+        # Bedrock settings (uses AWS credentials from environment)
+        bedrock_model=os.getenv("BEDROCK_MODEL", "us.amazon.nova-lite-v1:0"),
+        bedrock_region=os.getenv("BEDROCK_REGION", "us-east-2"),
         
         # MCPs
-        mcps = (os.getenv("MCPS", "mcps.hass.main,mcps.common.main")).split(','),
+        mcps=(os.getenv("MCPS", "mcps.hass.main,mcps.common.main")).split(','),
 
         # Logging
         log_level=os.getenv("LOG_LEVEL", "INFO")

@@ -1,11 +1,15 @@
-"""Agent module for homeGPT using Strands with OpenAI and MCPs"""
+"""Agent module for homeGPT using Strands with OpenAI/Bedrock and MCPs"""
 import os
+import sys
+import io
 import logging
 from contextlib import ExitStack
 from dataclasses import dataclass, field
+from typing import Literal
 
 from strands import Agent as StrandsAgent 
 from strands.models.openai import OpenAIModel
+from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
@@ -18,7 +22,7 @@ When I ask for something, do this policy:
 
 1) Resolve intent:
    - Action (on/off/toggle/set/scene) + Targets (entities/areas) + Options (brightness, temp, %).
-   - If the entity_id is unknown, search by friendly name/area; prefer best-effort resolution.
+   - Search for the entity_id only using one word name/area; prefer best-effort resolution (i.e. "plant box" should be searched using "plant").
    - Avoid asking for clarification unless there is true ambiguity in what the request is. 
    - Ask 1 short clarification if the action is risky (unlock/door/drain).
 
@@ -29,8 +33,7 @@ When I ask for something, do this policy:
      • When searching for devices only use one key word (e.g., "light" or "office").
    - Use your best judgment to resolve ambiguities (e.g., multiple "closet light", "upstairs living room" is the "living room").
 
-3) No-ops & batching:
-   - If the device is already in the desired state, say so and don't call a service.
+3) Batching:
    - If a request clearly affects multiple devices ("turn off office lights"), batch them.
 
 4) Act & verify:
@@ -64,8 +67,18 @@ class MCPServerConfig:
 @dataclass
 class AgentConfig:
     """Configuration for the agent"""
-    openai_api_key: str
-    openai_model: str = "gpt-4.1"
+    # Model provider: "openai" or "bedrock"
+    model_provider: Literal["openai", "bedrock"] = "openai"
+    
+    # OpenAI settings
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-4o-mini"
+    
+    # Bedrock settings (uses AWS credentials from environment/boto3)
+    bedrock_model: str = "us.amazon.nova-lite-v1:0"
+    bedrock_region: str = "us-east-2"
+    
+    # Common settings
     temperature: float = 0.7
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
@@ -73,19 +86,27 @@ class AgentConfig:
 
 class HomeAgent:
     """
-    Home Assistant agent using Strands with OpenAI and MCPs.
+    Home Assistant agent using Strands with OpenAI/Bedrock and MCPs.
     
     Usage:
+        # OpenAI
+        config = AgentConfig(
+            model_provider="openai",
+            openai_api_key="sk-...",
+            openai_model="gpt-4o-mini"
+        )
+        
+        # Bedrock (uses AWS credentials from environment)
+        config = AgentConfig(
+            model_provider="bedrock",
+            bedrock_model="anthropic.claude-3-5-sonnet-20241022-v2:0",
+            bedrock_region="us-west-2"
+        )
+        
         agent = HomeAgent(config)
-        agent.start()  # Initialize MCP connections once
-        
-        # For single requests:
+        agent.start()
         response = agent.process("turn on the lights")
-        
-        # For async usage in the assistant:
-        response = await agent.process_async("turn on the lights")
-        
-        agent.stop()  # Cleanup on shutdown
+        agent.stop()
     """
     
     def __init__(self, config: AgentConfig):
@@ -96,16 +117,38 @@ class HomeAgent:
         self._tools: list = []
         self._started = False
         
-        logger.info(f"HomeAgent initialized with model {self.config.openai_model}")
+        model_name = (
+            self.config.openai_model if self.config.model_provider == "openai" 
+            else self.config.bedrock_model
+        )
+        logger.info(f"HomeAgent initialized with {self.config.model_provider} model: {model_name}")
         logger.info(f"Configured {len(self._mcp_clients)} MCP servers")
     
-    def _init_model(self) -> OpenAIModel:
-        """Initialize the OpenAI model"""
-        return OpenAIModel(
-            client_args={"api_key": self.config.openai_api_key},
-            model_id=self.config.openai_model,
-            params={"temperature": self.config.temperature},
-        )
+    def _init_model(self) -> OpenAIModel | BedrockModel:
+        """Initialize the model based on provider"""
+        if self.config.model_provider == "openai":
+            if not self.config.openai_api_key:
+                raise ValueError("OpenAI API key required when using openai provider")
+            
+            return OpenAIModel(
+                client_args={"api_key": self.config.openai_api_key},
+                model_id=self.config.openai_model,
+                params={"temperature": self.config.temperature},
+            )
+        
+        elif self.config.model_provider == "bedrock":
+            # Bedrock uses AWS credentials from environment/boto3
+            # Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+            # Or use `aws configure` CLI
+            return BedrockModel(
+                model_id=self.config.bedrock_model,
+                region_name=self.config.bedrock_region,
+                temperature=self.config.temperature,
+                streaming=True,
+            )
+        
+        else:
+            raise ValueError(f"Unknown model provider: {self.config.model_provider}")
     
     def _init_mcp_clients(self) -> list[MCPClient]:
         """Initialize MCP clients for each configured server"""
@@ -188,7 +231,15 @@ class HomeAgent:
             system_prompt=self.config.system_prompt,
         )
         
-        result = agent(request_text)
+        # Suppress stdout from Strands (it prints tool calls)
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        
+        try:
+            result = agent(request_text)
+        finally:
+            sys.stdout = old_stdout
+        
         response_text = result.message["content"][0]["text"]
         
         logger.info(f"Response: {response_text}")

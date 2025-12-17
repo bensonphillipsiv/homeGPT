@@ -26,6 +26,7 @@ async def main():
     logger.info("Starting HomeGPT..")
     logger.info(f"API enabled: {config.enable_api}")
     logger.info(f"Audio type: {config.audio_type}")
+    logger.info(f"Model provider: {config.model_provider}")
     
     # Handle shutdown signals
     shutdown_event = asyncio.Event()
@@ -48,6 +49,7 @@ async def main():
 
     asr = OpenWhisperASR()
 
+    # Build MCP server configs
     mcp_servers = []
     for mcp_module in config.mcps:
         mcp_servers.append(
@@ -57,14 +59,22 @@ async def main():
                 args=["run", "-m", mcp_module],
             )
         )
+    
+    # Build agent config based on provider
     agent_config = AgentConfig(
+        model_provider=config.model_provider,
+        # OpenAI settings
         openai_api_key=config.openai_api_key,
         openai_model=config.openai_model,
+        # Bedrock settings
+        bedrock_model=config.bedrock_model,
+        bedrock_region=config.bedrock_region,
+        # MCP servers
         mcp_servers=mcp_servers,
     )
+    
     agent = HomeAgent(agent_config)
     agent.start()
-
 
     # Build assistant
     assistant_config = AssistantConfig(
@@ -87,7 +97,7 @@ async def main():
     )
 
     assistant_task.cancel()
-    agent.stop
+    agent.stop()
     try:
         await assistant_task
     except asyncio.CancelledError:
