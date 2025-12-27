@@ -1,5 +1,5 @@
 """
-Local and PulseAudio network streaming for audio I/O.
+Local and remote TCP streaming for audio I/O.
 """
 import pyaudio
 import asyncio
@@ -25,10 +25,11 @@ class AudioConfig:
     channels: int = 1
     input_frames: int = 1280  # 80ms at 16kHz
 
-    # Remote settings (for PulseAudio)
-    device_ip: str = "192.168.1.132"
-    listener_port: int = 4712
-    speaker_port: int = 4713
+    # Remote settings (TCP streaming to/from Raspberry Pi)
+    device_ip: str = "192.168.1.131"
+    listener_port: int = 4712   # Server listens for mic audio from Pi
+    speaker_port: int = 4713    # Server connects to Pi's speaker listener
+
 
 class LocalAudio:
     """Local audio using PyAudio"""
@@ -40,7 +41,6 @@ class LocalAudio:
         self.output_stream = None
     
     async def connect(self):
-        # PyAudio is blocking, run in thread
         def _connect():
             self.pa = pyaudio.PyAudio()
             
@@ -67,7 +67,6 @@ class LocalAudio:
         if self.input_stream is None:
             raise RuntimeError("Input stream not connected")
         
-        # read() is blocking, run in thread
         return await asyncio.to_thread(
             self.input_stream.read, 
             self.config.input_frames,
@@ -81,6 +80,12 @@ class LocalAudio:
         
         await asyncio.to_thread(self.output_stream.write, audio)
     
+    def write_sync(self, audio: bytes) -> None:
+        """Write audio to output (synchronous)"""
+        if self.output_stream is None:
+            raise RuntimeError("Output stream not connected")
+        self.output_stream.write(audio)
+    
     async def close(self):
         if self.input_stream:
             self.input_stream.stop_stream()
@@ -92,19 +97,164 @@ class LocalAudio:
             self.pa.terminate()
         logger.info("Local audio closed")
 
+
+class RemoteAudio:
+    """
+    Remote audio via TCP sockets to a Raspberry Pi running pi_audio_streamer.py
+    
+    Architecture:
+    - Microphone: Pi connects to Server:4712, sends audio
+                  Server listens on 4712, receives raw PCM
+    - Speaker:    Pi listens on 4713
+                  Server connects to Pi:4713, sends raw PCM
+    """
+    
+    def __init__(self, config: AudioConfig | None = None):
+        self.config = config or AudioConfig()
+        
+        # Sockets
+        self._mic_server: socket.socket | None = None
+        self._mic_conn: socket.socket | None = None
+        self._speaker_socket: socket.socket | None = None
+        
+        # Buffer for incomplete frames
+        self._read_buffer = b""
+        
+        # Frame size in bytes (16-bit mono)
+        self._frame_bytes = self.config.input_frames * 2
+        
+        self._connected = False
+    
+    async def connect(self):
+        """Establish connections for mic and speaker"""
+        await asyncio.to_thread(self._connect_sync)
+    
+    def _connect_sync(self):
+        """Synchronous connection setup"""
+        # === Microphone: We listen, Pi connects to us ===
+        self._mic_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._mic_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._mic_server.bind(("0.0.0.0", self.config.listener_port))
+        self._mic_server.listen(1)
+        self._mic_server.settimeout(60.0)
+        
+        logger.info(f"Waiting for Pi microphone on port {self.config.listener_port}...")
+        
+        try:
+            self._mic_conn, addr = self._mic_server.accept()
+            self._mic_conn.settimeout(5.0)
+            logger.info(f"Microphone connected from {addr}")
+        except socket.timeout:
+            raise ConnectionError(
+                f"Timeout waiting for Pi. Run on Pi: python pi_audio_streamer.py --server <this_ip>"
+            )
+        
+        # === Speaker: We connect to Pi's listener ===
+        self._speaker_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._speaker_socket.settimeout(10.0)
+        
+        logger.info(f"Connecting to Pi speaker at {self.config.device_ip}:{self.config.speaker_port}...")
+        
+        # Retry a few times - Pi might still be starting up
+        for attempt in range(5):
+            try:
+                self._speaker_socket.connect((self.config.device_ip, self.config.speaker_port))
+                self._speaker_socket.settimeout(None)  # No timeout for sends
+                logger.info("Speaker connected")
+                break
+            except (socket.timeout, ConnectionRefusedError) as e:
+                if attempt < 4:
+                    logger.info(f"Speaker connection attempt {attempt + 1} failed, retrying...")
+                    time.sleep(1)
+                else:
+                    raise ConnectionError(
+                        f"Failed to connect to Pi speaker at {self.config.device_ip}:{self.config.speaker_port}"
+                    )
+        
+        self._connected = True
+        logger.info("Remote audio connected")
+    
+    async def read(self) -> bytes:
+        """Read one frame of audio from Pi's microphone"""
+        if not self._connected or self._mic_conn is None:
+            raise RuntimeError("Remote audio not connected")
+        
+        return await asyncio.to_thread(self._read_sync)
+    
+    def _read_sync(self) -> bytes:
+        """Synchronous read with buffering"""
+        while len(self._read_buffer) < self._frame_bytes:
+            try:
+                chunk = self._mic_conn.recv(4096)
+                if not chunk:
+                    raise ConnectionError("Microphone connection closed by Pi")
+                self._read_buffer += chunk
+            except socket.timeout:
+                logger.warning("Mic read timeout, returning silence")
+                return b"\x00" * self._frame_bytes
+        
+        # Extract one frame
+        frame = self._read_buffer[:self._frame_bytes]
+        self._read_buffer = self._read_buffer[self._frame_bytes:]
+        return frame
+    
+    async def write(self, audio: bytes) -> None:
+        """Write audio to Pi's speaker"""
+        if not self._connected or self._speaker_socket is None:
+            raise RuntimeError("Remote audio not connected")
+        
+        await asyncio.to_thread(self._write_sync, audio)
+    
+    def _write_sync(self, audio: bytes) -> None:
+        """Synchronous write"""
+        if self._speaker_socket is None:
+            logger.warning("Speaker not connected, skipping write")
+            return
+        
+        try:
+            self._speaker_socket.sendall(audio)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            logger.error(f"Speaker write failed: {e}")
+            # Don't raise - just log. TTS will continue, audio just won't play.
+            # This prevents crashes during speaker reconnection.
+    
+    def write_sync(self, audio: bytes) -> None:
+        """Write audio synchronously (used by TTS)"""
+        if not self._connected:
+            return
+        self._write_sync(audio)
+    
+    async def close(self):
+        """Close all connections"""
+        self._connected = False
+        
+        for sock in [self._mic_conn, self._mic_server, self._speaker_socket]:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        
+        self._mic_conn = None
+        self._mic_server = None
+        self._speaker_socket = None
+        self._read_buffer = b""
+        
+        logger.info("Remote audio closed")
+
+
 class Audio:
     """Unified audio interface for local or remote audio"""
     
     def __init__(self, config: AudioConfig | None = None):
         self.config = config or AudioConfig()
-        self._backend = None
+        self._backend: LocalAudio | RemoteAudio | None = None
     
     async def connect(self) -> None:
         if self.config.audio_type == "local":
             self._backend = LocalAudio(self.config)
         elif self.config.audio_type == "remote":
-            # TODO: Add PulseAudio network backend
-            raise NotImplementedError("Remote audio not yet implemented")
+            self._backend = RemoteAudio(self.config)
         else:
             raise ValueError(f"Unsupported audio type: {self.config.audio_type}")
         
@@ -126,15 +276,13 @@ class Audio:
         """Write audio to speakers (synchronous)"""
         if self._backend is None:
             raise RuntimeError("Audio not connected")
-        self._backend.output_stream.write(audio)
+        self._backend.write_sync(audio)
 
     async def play_alert(self):
         """Play wake word acknowledgment sound"""
-        
         duration = 0.15
         t = np.linspace(0, duration, int(self.config.sample_rate * duration), endpoint=False)
         
-        # Simple bell sound
         freq = 800
         sound = np.sin(2 * np.pi * freq * t) * np.exp(-4 * t) * 0.3
         
@@ -150,20 +298,14 @@ class Audio:
 @dataclass
 class OpenWakeWordConfig:
     """Configuration for OpenWakeWord detector"""
-    # Model settings (None uses default bundled models)
     model_paths: list[str] | None = None
-    
-    # Detection settings
     threshold: float = 0.9
-    
-    # Audio settings
     sample_rate: int = 16000
-    frame_size_ms: int = 80  # OpenWakeWord needs 80ms frames
+    frame_size_ms: int = 80
+
 
 class OpenWakeWordDetector:
-    """
-    OpenWakeWord implementation.
-    """
+    """OpenWakeWord implementation."""
     
     def __init__(self, config: OpenWakeWordConfig | None = None):
         self.config = config or OpenWakeWordConfig()
@@ -173,28 +315,15 @@ class OpenWakeWordDetector:
         else:
             self._model = OWWModel()
         
-        # Get available keywords
         self._keywords = list(self._model.models.keys())
         logger.info(f"Wake word detector initialized with keywords: {self._keywords}")
     
     def process_frame(self, audio: bytes):
-        """
-        Process an audio frame for wake word detection.
-        
-        Args:
-            audio: Raw PCM audio (80ms frame, 16-bit signed, mono)
-            
-        Returns:
-            WakeWordEvent if detected, None otherwise
-        """
-        # Convert bytes to samples
+        """Process an audio frame for wake word detection."""
         samples_per_frame = self.config.sample_rate * self.config.frame_size_ms // 1000
         frame = struct.unpack(f"{samples_per_frame}h", audio)
-        
-        # Get predictions
         scores = self._model.predict(frame)
         
-        # Check each keyword
         for keyword, score in scores.items():
             if score > self.config.threshold:
                 logger.debug(f"Wake word '{keyword}' detected with score {score:.3f}")
@@ -211,40 +340,26 @@ class OpenWakeWordDetector:
 @dataclass
 class WebRTCVADConfig:
     """Configuration for WebRTC VAD"""
-    # Aggressiveness mode (0-3, higher = more aggressive filtering)
     aggressiveness: int = 3
-    
-    # Audio settings
     SAMPLE_RATE: int = 16000
-    FRAME_SIZE_MS: int = 20  # WebRTC VAD needs 10, 20, or 30ms frames
-    SAMPLES_PER_80MS = SAMPLE_RATE * 80 // 1000  # 1280 samples
-    SAMPLES_PER_20MS = SAMPLE_RATE * 20 // 1000  # 320 samples
-    BYTES_PER_20MS = SAMPLES_PER_20MS * 2  # 640 bytes (16-bit audio)
+    FRAME_SIZE_MS: int = 20
+    SAMPLES_PER_80MS = SAMPLE_RATE * 80 // 1000
+    SAMPLES_PER_20MS = SAMPLE_RATE * 20 // 1000
+    BYTES_PER_20MS = SAMPLES_PER_20MS * 2
+
 
 class WebRTCVADDetector:
-    """
-    Adapter: WebRTC VAD implementation of VADDetector.
-    """
+    """WebRTC VAD implementation."""
     
     def __init__(self, config: WebRTCVADConfig | None = None):
         self.config = config or WebRTCVADConfig()
         self._vad = webrtcvad.Vad(self.config.aggressiveness)
     
     def is_speech(self, audio: bytes) -> bool:
-        """
-        Check if audio frame contains speech.
-        
-        Args:
-            audio: Raw PCM audio (20ms frame, 16-bit signed, mono)
-            
-        Returns:
-            True if speech detected
-        """
-
+        """Check if audio frame contains speech."""
         for subframe in self._split_20ms_frames(audio):
             if not self._vad.is_speech(subframe, self.config.SAMPLE_RATE):
                 return False
-    
         return True
     
     def _split_20ms_frames(self, frame_80ms: bytes):
@@ -254,6 +369,7 @@ class WebRTCVADDetector:
             end = start + self.config.BYTES_PER_20MS
             yield frame_80ms[start:end]
 
+
 # ========== ASR ==========
 @dataclass
 class OpenWhisperASRConfig:
@@ -262,23 +378,23 @@ class OpenWhisperASRConfig:
     device: str = "cpu"
     compute_type: str = "int8"
 
+
 class OpenWhisperASR:
-    """
-    Adapter: WebRTC VAD implementation of VADDetector.
-    """
+    """Whisper ASR implementation."""
     
     def __init__(self, config: OpenWhisperASRConfig | None = None):
         self.config = config or OpenWhisperASRConfig()
-        self.asr = WhisperModel(self.config.model_size, device=self.config.device, compute_type=self.config.compute_type)
+        self.asr = WhisperModel(
+            self.config.model_size,
+            device=self.config.device,
+            compute_type=self.config.compute_type
+        )
     
     def transcribe(self, request_audio):
-        """
-        Process audio data with ASR and return the transcribed text.
-        """
+        """Process audio data with ASR and return the transcribed text."""
         pcm_f32 = np.frombuffer(request_audio, dtype=np.int16).astype(np.float32) / 32768.0
         segments, _ = self.asr.transcribe(pcm_f32, beam_size=5, vad_filter=False)
         request_text = " ".join(s.text for s in segments).strip()
-
         return request_text
 
 
@@ -288,40 +404,21 @@ class PiperTTSConfig:
     """Configuration for Piper TTS"""
     model_path: str = "./models/lessac_low_model.onnx"
 
+
 class PiperTTS:
-    """
-    Piper TTS with streaming audio output via PyAudio.
-    
-    Usage:
-        tts = PiperTTS(PiperTTSConfig(model_path="./models/en_US-lessac-medium.onnx"))
-        await tts.speak("Hello world", audio)
-    """
+    """Piper TTS with streaming audio output."""
     
     def __init__(self, config: PiperTTSConfig | None = None):
         self.config = config or PiperTTSConfig()
         self._voice = PiperVoice.load(self.config.model_path)
     
     def synthesize_stream(self, text: str):
-        """
-        Generator that yields audio chunks as they're synthesized.
-        
-        Args:
-            text: Text to synthesize
-            
-        Yields:
-            bytes: Raw PCM audio chunks (16-bit signed, mono)
-        """
+        """Generator that yields audio chunks as they're synthesized."""
         for chunk in self._voice.synthesize(text):
             yield chunk.audio_int16_bytes
     
     def speak(self, text: str, audio: "Audio") -> None:
-        """
-        Speak text through the audio output in streaming mode.
-        
-        Args:
-            text: Text to speak
-            audio: Audio instance for output
-        """
+        """Speak text through the audio output in streaming mode."""
         if not text.strip():
             return
         

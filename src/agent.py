@@ -135,18 +135,13 @@ class HomeAgent:
                 model_id=self.config.openai_model,
                 params={"temperature": self.config.temperature},
             )
-        
         elif self.config.model_provider == "bedrock":
-            # Bedrock uses AWS credentials from environment/boto3
-            # Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
-            # Or use `aws configure` CLI
             return BedrockModel(
                 model_id=self.config.bedrock_model,
                 region_name=self.config.bedrock_region,
                 temperature=self.config.temperature,
                 streaming=True,
             )
-        
         else:
             raise ValueError(f"Unknown model provider: {self.config.model_provider}")
     

@@ -39,9 +39,20 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, signal_handler)
     
-    # Initialize audio
-    audio_config = AudioConfig(audio_type=config.audio_type)
+    # Initialize audio with config
+    audio_config = AudioConfig(
+        audio_type=config.audio_type,
+        device_ip=config.audio_device_ip,
+        listener_port=config.audio_listener_port,
+        speaker_port=config.audio_speaker_port,
+    )
     audio = Audio(audio_config)
+    
+    if config.audio_type == "remote":
+        logger.info(f"Remote audio config:")
+        logger.info(f"  Pi IP: {config.audio_device_ip}")
+        logger.info(f"  Mic port: {config.audio_listener_port} (server listens)")
+        logger.info(f"  Speaker port: {config.audio_speaker_port} (Pi listens)")
 
     wakeword = OpenWakeWordDetector()
 

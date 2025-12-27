@@ -55,8 +55,8 @@ def load_config() -> Config:
         api_port=int(os.getenv("API_PORT", "8000")),
         
         # Audio
-        audio_type=os.getenv("AUDIO_TYPE", "local"),
-        audio_device_ip=os.getenv("AUDIO_DEVICE_IP", "192.168.1.132"),
+        audio_type=os.getenv("AUDIO_TYPE", "remote"),
+        audio_device_ip=os.getenv("AUDIO_DEVICE_IP", "192.168.1.131"),
         audio_listener_port=int(os.getenv("AUDIO_LISTENER_PORT", "4712")),
         audio_speaker_port=int(os.getenv("AUDIO_SPEAKER_PORT", "4713")),
         
