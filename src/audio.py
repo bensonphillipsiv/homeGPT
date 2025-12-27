@@ -31,9 +31,7 @@ class AudioConfig:
     speaker_port: int = 4713    # Server connects to Pi's speaker listener
     
     # Retry settings
-    initial_retry_delay: float = 1.0
-    max_retry_delay: float = 3600.0  # 1 hour max
-    retry_multiplier: float = 2.0
+    retry_delay: float = 5.0
 
 
 class LocalAudio:
@@ -130,17 +128,12 @@ class RemoteAudio:
         
         self._connected = False
     
-    def _get_retry_delay(self, attempt: int) -> float:
-        """Calculate retry delay with exponential backoff"""
-        delay = self.config.initial_retry_delay * (self.config.retry_multiplier ** attempt)
-        return min(delay, self.config.max_retry_delay)
-    
     async def connect(self):
         """Establish connections for mic and speaker with retry"""
         await asyncio.to_thread(self._connect_sync)
     
     def _connect_sync(self):
-        """Synchronous connection setup with exponential backoff retry"""
+        """Synchronous connection setup with retry"""
         # === Microphone: We listen, Pi connects to us ===
         self._connect_mic_with_retry()
         
@@ -151,7 +144,7 @@ class RemoteAudio:
         logger.info("Remote audio connected")
     
     def _connect_mic_with_retry(self):
-        """Connect microphone with exponential backoff retry"""
+        """Connect microphone with fixed retry delay"""
         attempt = 0
         
         while True:
@@ -175,29 +168,27 @@ class RemoteAudio:
                 self._mic_conn.settimeout(5.0)
                 logger.info(f"Microphone connected from {addr}")
                 
-                # Success - reset attempt counter for next time
+                # Success
                 return
                 
             except socket.timeout:
-                retry_delay = self._get_retry_delay(attempt)
-                logger.warning(
-                    f"Timeout waiting for Pi microphone (attempt {attempt + 1}). "
-                    f"Retrying in {retry_delay:.1f}s..."
-                )
-                time.sleep(retry_delay)
                 attempt += 1
+                logger.warning(
+                    f"Timeout waiting for Pi microphone (attempt {attempt}). "
+                    f"Retrying in {self.config.retry_delay}s..."
+                )
+                time.sleep(self.config.retry_delay)
                 
             except Exception as e:
-                retry_delay = self._get_retry_delay(attempt)
-                logger.error(
-                    f"Mic connection error: {e} (attempt {attempt + 1}). "
-                    f"Retrying in {retry_delay:.1f}s..."
-                )
-                time.sleep(retry_delay)
                 attempt += 1
+                logger.error(
+                    f"Mic connection error: {e} (attempt {attempt}). "
+                    f"Retrying in {self.config.retry_delay}s..."
+                )
+                time.sleep(self.config.retry_delay)
     
     def _connect_speaker_with_retry(self):
-        """Connect speaker with exponential backoff retry"""
+        """Connect speaker with fixed retry delay"""
         attempt = 0
         
         while True:
@@ -225,22 +216,20 @@ class RemoteAudio:
                 return
                 
             except (socket.timeout, ConnectionRefusedError, OSError) as e:
-                retry_delay = self._get_retry_delay(attempt)
-                logger.warning(
-                    f"Speaker connection failed: {e} (attempt {attempt + 1}). "
-                    f"Retrying in {retry_delay:.1f}s..."
-                )
-                time.sleep(retry_delay)
                 attempt += 1
+                logger.warning(
+                    f"Speaker connection failed: {e} (attempt {attempt}). "
+                    f"Retrying in {self.config.retry_delay}s..."
+                )
+                time.sleep(self.config.retry_delay)
                 
             except Exception as e:
-                retry_delay = self._get_retry_delay(attempt)
-                logger.error(
-                    f"Speaker connection error: {e} (attempt {attempt + 1}). "
-                    f"Retrying in {retry_delay:.1f}s..."
-                )
-                time.sleep(retry_delay)
                 attempt += 1
+                logger.error(
+                    f"Speaker connection error: {e} (attempt {attempt}). "
+                    f"Retrying in {self.config.retry_delay}s..."
+                )
+                time.sleep(self.config.retry_delay)
     
     async def read(self) -> bytes:
         """Read one frame of audio from Pi's microphone"""
