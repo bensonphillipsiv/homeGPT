@@ -29,6 +29,11 @@ class AudioConfig:
     device_ip: str = "192.168.1.131"
     listener_port: int = 4712   # Server listens for mic audio from Pi
     speaker_port: int = 4713    # Server connects to Pi's speaker listener
+    
+    # Retry settings
+    initial_retry_delay: float = 1.0
+    max_retry_delay: float = 5.0
+    retry_multiplier: float = 1.2
 
 
 class LocalAudio:
@@ -125,54 +130,117 @@ class RemoteAudio:
         
         self._connected = False
     
+    def _get_retry_delay(self, attempt: int) -> float:
+        """Calculate retry delay with exponential backoff"""
+        delay = self.config.initial_retry_delay * (self.config.retry_multiplier ** attempt)
+        return min(delay, self.config.max_retry_delay)
+    
     async def connect(self):
-        """Establish connections for mic and speaker"""
+        """Establish connections for mic and speaker with retry"""
         await asyncio.to_thread(self._connect_sync)
     
     def _connect_sync(self):
-        """Synchronous connection setup"""
+        """Synchronous connection setup with exponential backoff retry"""
         # === Microphone: We listen, Pi connects to us ===
-        self._mic_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._mic_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._mic_server.bind(("0.0.0.0", self.config.listener_port))
-        self._mic_server.listen(1)
-        self._mic_server.settimeout(60.0)
-        
-        logger.info(f"Waiting for Pi microphone on port {self.config.listener_port}...")
-        
-        try:
-            self._mic_conn, addr = self._mic_server.accept()
-            self._mic_conn.settimeout(5.0)
-            logger.info(f"Microphone connected from {addr}")
-        except socket.timeout:
-            raise ConnectionError(
-                f"Timeout waiting for Pi. Run on Pi: python pi_audio_streamer.py --server <this_ip>"
-            )
+        self._connect_mic_with_retry()
         
         # === Speaker: We connect to Pi's listener ===
-        self._speaker_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._speaker_socket.settimeout(10.0)
-        
-        logger.info(f"Connecting to Pi speaker at {self.config.device_ip}:{self.config.speaker_port}...")
-        
-        # Retry a few times - Pi might still be starting up
-        for attempt in range(5):
-            try:
-                self._speaker_socket.connect((self.config.device_ip, self.config.speaker_port))
-                self._speaker_socket.settimeout(None)  # No timeout for sends
-                logger.info("Speaker connected")
-                break
-            except (socket.timeout, ConnectionRefusedError) as e:
-                if attempt < 4:
-                    logger.info(f"Speaker connection attempt {attempt + 1} failed, retrying...")
-                    time.sleep(1)
-                else:
-                    raise ConnectionError(
-                        f"Failed to connect to Pi speaker at {self.config.device_ip}:{self.config.speaker_port}"
-                    )
+        self._connect_speaker_with_retry()
         
         self._connected = True
         logger.info("Remote audio connected")
+    
+    def _connect_mic_with_retry(self):
+        """Connect microphone with exponential backoff retry"""
+        attempt = 0
+        
+        while True:
+            try:
+                # Clean up any existing socket
+                if self._mic_server:
+                    try:
+                        self._mic_server.close()
+                    except:
+                        pass
+                
+                self._mic_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._mic_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._mic_server.bind(("0.0.0.0", self.config.listener_port))
+                self._mic_server.listen(1)
+                self._mic_server.settimeout(30.0)  # 30 second timeout per attempt
+                
+                logger.info(f"Waiting for Pi microphone on port {self.config.listener_port}...")
+                
+                self._mic_conn, addr = self._mic_server.accept()
+                self._mic_conn.settimeout(5.0)
+                logger.info(f"Microphone connected from {addr}")
+                
+                # Success - reset attempt counter for next time
+                return
+                
+            except socket.timeout:
+                retry_delay = self._get_retry_delay(attempt)
+                logger.warning(
+                    f"Timeout waiting for Pi microphone (attempt {attempt + 1}). "
+                    f"Retrying in {retry_delay:.1f}s..."
+                )
+                time.sleep(retry_delay)
+                attempt += 1
+                
+            except Exception as e:
+                retry_delay = self._get_retry_delay(attempt)
+                logger.error(
+                    f"Mic connection error: {e} (attempt {attempt + 1}). "
+                    f"Retrying in {retry_delay:.1f}s..."
+                )
+                time.sleep(retry_delay)
+                attempt += 1
+    
+    def _connect_speaker_with_retry(self):
+        """Connect speaker with exponential backoff retry"""
+        attempt = 0
+        
+        while True:
+            try:
+                # Clean up any existing socket
+                if self._speaker_socket:
+                    try:
+                        self._speaker_socket.close()
+                    except:
+                        pass
+                
+                self._speaker_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._speaker_socket.settimeout(10.0)
+                
+                logger.info(
+                    f"Connecting to Pi speaker at "
+                    f"{self.config.device_ip}:{self.config.speaker_port}..."
+                )
+                
+                self._speaker_socket.connect((self.config.device_ip, self.config.speaker_port))
+                self._speaker_socket.settimeout(None)  # No timeout for sends
+                logger.info("Speaker connected")
+                
+                # Success
+                return
+                
+            except (socket.timeout, ConnectionRefusedError, OSError) as e:
+                retry_delay = self._get_retry_delay(attempt)
+                logger.warning(
+                    f"Speaker connection failed: {e} (attempt {attempt + 1}). "
+                    f"Retrying in {retry_delay:.1f}s..."
+                )
+                time.sleep(retry_delay)
+                attempt += 1
+                
+            except Exception as e:
+                retry_delay = self._get_retry_delay(attempt)
+                logger.error(
+                    f"Speaker connection error: {e} (attempt {attempt + 1}). "
+                    f"Retrying in {retry_delay:.1f}s..."
+                )
+                time.sleep(retry_delay)
+                attempt += 1
     
     async def read(self) -> bytes:
         """Read one frame of audio from Pi's microphone"""
@@ -182,21 +250,55 @@ class RemoteAudio:
         return await asyncio.to_thread(self._read_sync)
     
     def _read_sync(self) -> bytes:
-        """Synchronous read with buffering"""
+        """Synchronous read with buffering and auto-reconnect"""
         while len(self._read_buffer) < self._frame_bytes:
             try:
+                if self._mic_conn is None:
+                    self._reconnect_mic()
+                
                 chunk = self._mic_conn.recv(4096)
                 if not chunk:
-                    raise ConnectionError("Microphone connection closed by Pi")
+                    logger.warning("Microphone connection closed by Pi, reconnecting...")
+                    self._reconnect_mic()
+                    continue
                 self._read_buffer += chunk
+                
             except socket.timeout:
                 logger.warning("Mic read timeout, returning silence")
                 return b"\x00" * self._frame_bytes
+            
+            except (ConnectionError, OSError, BrokenPipeError) as e:
+                logger.warning(f"Mic connection lost: {e}, reconnecting...")
+                self._reconnect_mic()
+                continue
         
         # Extract one frame
         frame = self._read_buffer[:self._frame_bytes]
         self._read_buffer = self._read_buffer[self._frame_bytes:]
         return frame
+    
+    def _reconnect_mic(self):
+        """Reconnect microphone with retry"""
+        # Close existing connections
+        if self._mic_conn:
+            try:
+                self._mic_conn.close()
+            except:
+                pass
+            self._mic_conn = None
+        
+        if self._mic_server:
+            try:
+                self._mic_server.close()
+            except:
+                pass
+            self._mic_server = None
+        
+        # Clear buffer
+        self._read_buffer = b""
+        
+        # Reconnect
+        self._connect_mic_with_retry()
     
     async def write(self, audio: bytes) -> None:
         """Write audio to Pi's speaker"""
@@ -206,17 +308,34 @@ class RemoteAudio:
         await asyncio.to_thread(self._write_sync, audio)
     
     def _write_sync(self, audio: bytes) -> None:
-        """Synchronous write"""
+        """Synchronous write with auto-reconnect"""
         if self._speaker_socket is None:
-            logger.warning("Speaker not connected, skipping write")
-            return
+            logger.warning("Speaker not connected, attempting reconnect...")
+            self._reconnect_speaker()
         
         try:
             self._speaker_socket.sendall(audio)
-        except (BrokenPipeError, ConnectionResetError) as e:
-            logger.error(f"Speaker write failed: {e}")
-            # Don't raise - just log. TTS will continue, audio just won't play.
-            # This prevents crashes during speaker reconnection.
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            logger.warning(f"Speaker write failed: {e}, reconnecting...")
+            self._reconnect_speaker()
+            # Try once more after reconnect
+            try:
+                if self._speaker_socket:
+                    self._speaker_socket.sendall(audio)
+            except Exception as e2:
+                logger.error(f"Speaker write failed after reconnect: {e2}")
+    
+    def _reconnect_speaker(self):
+        """Reconnect speaker with retry"""
+        if self._speaker_socket:
+            try:
+                self._speaker_socket.close()
+            except:
+                pass
+            self._speaker_socket = None
+        
+        # Reconnect
+        self._connect_speaker_with_retry()
     
     def write_sync(self, audio: bytes) -> None:
         """Write audio synchronously (used by TTS)"""

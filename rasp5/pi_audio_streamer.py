@@ -4,10 +4,11 @@ HomeGPT Raspberry Pi Audio Streamer
 
 Streams microphone audio to server and receives TTS audio back.
 Uses PyAudio for audio I/O and TCP sockets for network transport.
+Controlled by Home Assistant switch.homegpt entity.
 
 Usage:
-    python pi_audio_streamer.py --server 192.168.1.100
-    python pi_audio_streamer.py --server 192.168.1.100 --mic-port 4712 --speaker-port 4713
+    uv run pi_audio_streamer.py
+    uv run pi_audio_streamer.py --server 192.168.1.100
 """
 
 import argparse
@@ -17,8 +18,14 @@ import threading
 import time
 import signal
 import sys
+import os
 
 import pyaudio
+import requests
+from dotenv import load_dotenv
+
+# Load .env file
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,14 +39,68 @@ CHANNELS = 1
 FORMAT = pyaudio.paInt16
 CHUNK_SIZE = 1280  # 80ms at 16kHz
 
+# Home Assistant settings
+HA_CHECK_INTERVAL = 5.0  # seconds
+HA_ENTITY_ID = os.environ.get("HA_ENTITY", "input_boolean.homegpt")
+
+
+class HomeAssistantClient:
+    """Client for checking Home Assistant switch state."""
+    
+    def __init__(self, ha_url: str, ha_token: str, entity_id: str = HA_ENTITY_ID):
+        self.ha_url = ha_url.rstrip("/")
+        self.ha_token = ha_token
+        self.entity_id = entity_id
+        self._headers = {
+            "Authorization": f"Bearer {ha_token}",
+            "Content-Type": "application/json",
+        }
+    
+    def is_switch_on(self) -> bool:
+        """Check if the Home Assistant switch is on.
+        
+        Returns False if:
+        - Switch is off
+        - Request fails
+        - Entity not found
+        - Any error occurs
+        """
+        try:
+            url = f"{self.ha_url}/api/states/{self.entity_id}"
+            response = requests.get(url, headers=self._headers, timeout=5.0)
+            
+            if response.status_code == 200:
+                state = response.json().get("state", "off")
+                return state.lower() == "on"
+            else:
+                logger.warning(f"HA API returned status {response.status_code}")
+                return False
+                
+        except requests.exceptions.Timeout:
+            logger.warning("HA API request timed out")
+            return False
+        except requests.exceptions.ConnectionError:
+            logger.warning("HA API connection failed")
+            return False
+        except Exception as e:
+            logger.error(f"HA API error: {e}")
+            return False
+
 
 class AudioStreamer:
     """Handles bidirectional audio streaming to/from server."""
     
-    def __init__(self, server_ip: str, mic_port: int = 4712, speaker_port: int = 4713):
+    def __init__(
+        self,
+        server_ip: str,
+        mic_port: int = 4712,
+        speaker_port: int = 4713,
+        ha_client: HomeAssistantClient | None = None,
+    ):
         self.server_ip = server_ip
         self.mic_port = mic_port
         self.speaker_port = speaker_port
+        self.ha_client = ha_client
         
         self.pa = None
         self.mic_stream = None
@@ -50,21 +111,33 @@ class AudioStreamer:
         self.speaker_conn = None
         
         self._running = False
+        self._streaming_enabled = False  # Controlled by HA switch
         self._mic_thread = None
         self._speaker_thread = None
+        self._ha_thread = None
     
     def start(self):
-        """Start audio streaming."""
+        """Start audio streamer (waits for HA switch to enable streaming)."""
         logger.info(f"Starting audio streamer")
         logger.info(f"  Server: {self.server_ip}")
         logger.info(f"  Mic port: {self.mic_port} (Pi → Server)")
         logger.info(f"  Speaker port: {self.speaker_port} (Server → Pi)")
+        
+        if self.ha_client:
+            logger.info(f"  HA control: {self.ha_client.entity_id}")
+        else:
+            logger.info("  HA control: disabled (always streaming)")
+            self._streaming_enabled = True
         
         self._running = True
         
         # Initialize PyAudio
         self.pa = pyaudio.PyAudio()
         self._log_audio_devices()
+        
+        # Start HA monitor if configured
+        if self.ha_client:
+            self._start_ha_monitor()
         
         # Start speaker listener first (server will connect to us)
         self._start_speaker_listener()
@@ -86,6 +159,30 @@ class AudioStreamer:
                 direction.append("OUT")
             logger.info(f"  [{i}] {info['name']} ({'/'.join(direction)})")
     
+    def _start_ha_monitor(self):
+        """Start thread that monitors Home Assistant switch state."""
+        self._ha_thread = threading.Thread(target=self._ha_monitor_loop, daemon=True)
+        self._ha_thread.start()
+    
+    def _ha_monitor_loop(self):
+        """Monitor Home Assistant switch and update streaming state."""
+        while self._running:
+            try:
+                new_state = self.ha_client.is_switch_on()
+                
+                if new_state != self._streaming_enabled:
+                    self._streaming_enabled = new_state
+                    if new_state:
+                        logger.info("HA switch ON - streaming enabled")
+                    else:
+                        logger.info("HA switch OFF - streaming disabled")
+                
+            except Exception as e:
+                logger.error(f"HA monitor error: {e}")
+                self._streaming_enabled = False
+            
+            time.sleep(HA_CHECK_INTERVAL)
+    
     def _start_speaker_listener(self):
         """Start thread that listens for incoming TTS audio."""
         self._speaker_thread = threading.Thread(target=self._speaker_loop, daemon=True)
@@ -94,6 +191,11 @@ class AudioStreamer:
     def _speaker_loop(self):
         """Listen for server connection and play received audio."""
         while self._running:
+            # Wait for streaming to be enabled
+            if not self._streaming_enabled:
+                time.sleep(0.5)
+                continue
+            
             try:
                 # Create server socket
                 self.speaker_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -105,7 +207,7 @@ class AudioStreamer:
                 logger.info(f"Speaker listening on port {self.speaker_port}...")
                 
                 # Wait for server to connect
-                while self._running:
+                while self._running and self._streaming_enabled:
                     try:
                         self.speaker_conn, addr = self.speaker_server.accept()
                         logger.info(f"Speaker connected from {addr}")
@@ -113,8 +215,9 @@ class AudioStreamer:
                     except socket.timeout:
                         continue
                 
-                if not self._running:
-                    break
+                if not self._running or not self._streaming_enabled:
+                    self._cleanup_speaker()
+                    continue
                 
                 # Open speaker stream
                 self.speaker_stream = self.pa.open(
@@ -126,7 +229,7 @@ class AudioStreamer:
                 )
                 
                 # Receive and play audio
-                while self._running:
+                while self._running and self._streaming_enabled:
                     try:
                         data = self.speaker_conn.recv(4096)
                         if not data:
@@ -141,21 +244,33 @@ class AudioStreamer:
                 logger.error(f"Speaker error: {e}")
             
             finally:
-                # Cleanup for reconnect
-                if self.speaker_stream:
-                    self.speaker_stream.stop_stream()
-                    self.speaker_stream.close()
-                    self.speaker_stream = None
-                if self.speaker_conn:
-                    self.speaker_conn.close()
-                    self.speaker_conn = None
-                if self.speaker_server:
-                    self.speaker_server.close()
-                    self.speaker_server = None
+                self._cleanup_speaker()
             
-            if self._running:
+            if self._running and self._streaming_enabled:
                 logger.info("Speaker reconnecting in 2s...")
                 time.sleep(2)
+    
+    def _cleanup_speaker(self):
+        """Clean up speaker resources."""
+        if self.speaker_stream:
+            try:
+                self.speaker_stream.stop_stream()
+                self.speaker_stream.close()
+            except:
+                pass
+            self.speaker_stream = None
+        if self.speaker_conn:
+            try:
+                self.speaker_conn.close()
+            except:
+                pass
+            self.speaker_conn = None
+        if self.speaker_server:
+            try:
+                self.speaker_server.close()
+            except:
+                pass
+            self.speaker_server = None
     
     def _start_mic_sender(self):
         """Start thread that sends microphone audio to server."""
@@ -165,6 +280,11 @@ class AudioStreamer:
     def _mic_loop(self):
         """Connect to server and send microphone audio."""
         while self._running:
+            # Wait for streaming to be enabled
+            if not self._streaming_enabled:
+                time.sleep(0.5)
+                continue
+            
             try:
                 # Connect to server
                 self.mic_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -183,8 +303,8 @@ class AudioStreamer:
                     frames_per_buffer=CHUNK_SIZE,
                 )
                 
-                # Send audio
-                while self._running:
+                # Send audio while streaming is enabled
+                while self._running and self._streaming_enabled:
                     try:
                         data = self.mic_stream.read(CHUNK_SIZE, exception_on_overflow=False)
                         self.mic_socket.sendall(data)
@@ -203,31 +323,46 @@ class AudioStreamer:
                 logger.error(f"Mic error: {e}")
             
             finally:
-                # Cleanup for reconnect
-                if self.mic_stream:
-                    self.mic_stream.stop_stream()
-                    self.mic_stream.close()
-                    self.mic_stream = None
-                if self.mic_socket:
-                    self.mic_socket.close()
-                    self.mic_socket = None
+                self._cleanup_mic()
             
-            if self._running:
+            if self._running and self._streaming_enabled:
                 logger.info("Mic reconnecting in 2s...")
                 time.sleep(2)
+    
+    def _cleanup_mic(self):
+        """Clean up mic resources."""
+        if self.mic_stream:
+            try:
+                self.mic_stream.stop_stream()
+                self.mic_stream.close()
+            except:
+                pass
+            self.mic_stream = None
+        if self.mic_socket:
+            try:
+                self.mic_socket.close()
+            except:
+                pass
+            self.mic_socket = None
     
     def stop(self):
         """Stop audio streaming."""
         logger.info("Stopping audio streamer...")
         self._running = False
+        self._streaming_enabled = False
         
         # Wait for threads
         if self._mic_thread:
             self._mic_thread.join(timeout=3)
         if self._speaker_thread:
             self._speaker_thread.join(timeout=3)
+        if self._ha_thread:
+            self._ha_thread.join(timeout=3)
         
         # Cleanup
+        self._cleanup_mic()
+        self._cleanup_speaker()
+        
         if self.pa:
             self.pa.terminate()
         
@@ -244,15 +379,39 @@ class AudioStreamer:
 
 def main():
     parser = argparse.ArgumentParser(description="HomeGPT Pi Audio Streamer")
-    parser.add_argument("--server", "-s", required=True, help="Server IP address")
-    parser.add_argument("--mic-port", "-m", type=int, default=4712, help="Mic port (default: 4712)")
-    parser.add_argument("--speaker-port", "-p", type=int, default=4713, help="Speaker port (default: 4713)")
+    parser.add_argument("--server", "-s", help="Server IP address")
+    parser.add_argument("--mic-port", "-m", type=int, help="Mic port")
+    parser.add_argument("--speaker-port", "-p", type=int, help="Speaker port")
+    parser.add_argument("--ha-url", help="Home Assistant URL")
+    parser.add_argument("--ha-token", help="Home Assistant long-lived access token")
+    parser.add_argument("--ha-entity", help="HA entity ID")
     args = parser.parse_args()
     
+    # Load from args, then env vars, then defaults
+    server_ip = args.server or os.environ.get("SERVER_IP")
+    mic_port = args.mic_port or int(os.environ.get("MIC_PORT", "4712"))
+    speaker_port = args.speaker_port or int(os.environ.get("SPEAKER_PORT", "4713"))
+    ha_url = args.ha_url or os.environ.get("HOMEASSISTANT_URL")
+    ha_token = args.ha_token or os.environ.get("HOMEASSISTANT_TOKEN")
+    ha_entity = args.ha_entity or os.environ.get("HA_ENTITY", "input_boolean.homegpt")
+    
+    if not server_ip:
+        logger.error("Server IP required. Set SERVER_IP in .env or use --server")
+        sys.exit(1)
+    
+    # Create HA client if configured
+    ha_client = None
+    if ha_url and ha_token:
+        ha_client = HomeAssistantClient(ha_url, ha_token, ha_entity)
+        logger.info(f"Home Assistant control enabled: {ha_url}")
+    else:
+        logger.warning("No HA credentials provided - streaming will always be enabled")
+    
     streamer = AudioStreamer(
-        server_ip=args.server,
-        mic_port=args.mic_port,
-        speaker_port=args.speaker_port,
+        server_ip=server_ip,
+        mic_port=mic_port,
+        speaker_port=speaker_port,
+        ha_client=ha_client,
     )
     
     # Handle Ctrl+C

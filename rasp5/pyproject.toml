@@ -1,0 +1,13 @@
+[project]
+name = "pi-audio-streamer"
+version = "0.1.0"
+description = "HomeGPT Raspberry Pi Audio Streamer"
+requires-python = ">=3.11"
+dependencies = [
+    "pyaudio>=0.2.14",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+pi-audio-streamer = "pi_audio_streamer:main"
