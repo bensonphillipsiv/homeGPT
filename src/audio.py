@@ -253,8 +253,11 @@ class RemoteAudio:
                 self._read_buffer += chunk
                 
             except socket.timeout:
-                logger.warning("Mic read timeout, returning silence")
-                return b"\x00" * self._frame_bytes
+                logger.warning(
+                    f"Mic read timeout {self._consecutive_timeouts} times, reconnecting..."
+                )
+                self._reconnect_mic()
+                continue
             
             except (ConnectionError, OSError, BrokenPipeError) as e:
                 logger.warning(f"Mic connection lost: {e}, reconnecting...")
