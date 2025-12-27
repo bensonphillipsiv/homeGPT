@@ -32,8 +32,8 @@ class AudioConfig:
     
     # Retry settings
     initial_retry_delay: float = 1.0
-    max_retry_delay: float = 5.0
-    retry_multiplier: float = 1.2
+    max_retry_delay: float = 3600.0  # 1 hour max
+    retry_multiplier: float = 2.0
 
 
 class LocalAudio:
@@ -336,6 +336,21 @@ class RemoteAudio:
         
         # Reconnect
         self._connect_speaker_with_retry()
+        
+        # Play reconnect beep
+        self._play_alert_sync()
+    
+    def _play_alert_sync(self):
+        """Play alert sound synchronously"""
+        try:
+            duration = 0.15
+            t = np.linspace(0, duration, int(self.config.sample_rate * duration), endpoint=False)
+            freq = 800
+            sound = np.sin(2 * np.pi * freq * t) * np.exp(-4 * t) * 0.3
+            audio_bytes = (sound * 32767).astype(np.int16).tobytes()
+            self._write_sync(audio_bytes)
+        except Exception as e:
+            logger.warning(f"Failed to play reconnect beep: {e}")
     
     def write_sync(self, audio: bytes) -> None:
         """Write audio synchronously (used by TTS)"""
@@ -378,6 +393,9 @@ class Audio:
             raise ValueError(f"Unsupported audio type: {self.config.audio_type}")
         
         await self._backend.connect()
+        
+        # Play connection beep
+        await self.play_alert()
     
     async def read(self) -> bytes:
         """Read one frame of audio (80ms)"""
