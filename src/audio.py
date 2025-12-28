@@ -110,6 +110,9 @@ class RemoteAudio:
                   Server listens on 4712, receives raw PCM
     - Speaker:    Pi listens on 4713
                   Server connects to Pi:4713, sends raw PCM
+    
+    Connection model: Persistent connections. Pi maintains connection even when
+    not streaming audio. Server waits indefinitely for data.
     """
     
     def __init__(self, config: AudioConfig | None = None):
@@ -165,8 +168,12 @@ class RemoteAudio:
                 logger.info(f"Waiting for Pi microphone on port {self.config.listener_port}...")
                 
                 self._mic_conn, addr = self._mic_server.accept()
-                self._mic_conn.settimeout(5.0)
-                logger.info(f"Microphone connected from {addr}")
+                
+                # No timeout on the connection - wait indefinitely for data
+                # Pi maintains persistent connection and sends data when streaming is enabled
+                self._mic_conn.settimeout(None)
+                
+                logger.info(f"Microphone connected from {addr} (persistent connection mode)")
                 
                 # Success
                 return
@@ -210,7 +217,7 @@ class RemoteAudio:
                 
                 self._speaker_socket.connect((self.config.device_ip, self.config.speaker_port))
                 self._speaker_socket.settimeout(None)  # No timeout for sends
-                logger.info("Speaker connected")
+                logger.info("Speaker connected (persistent connection mode)")
                 
                 # Success
                 return
@@ -239,27 +246,26 @@ class RemoteAudio:
         return await asyncio.to_thread(self._read_sync)
     
     def _read_sync(self) -> bytes:
-        """Synchronous read with buffering and auto-reconnect"""
+        """Synchronous read with buffering. Waits indefinitely for data."""
         while len(self._read_buffer) < self._frame_bytes:
             try:
                 if self._mic_conn is None:
                     self._reconnect_mic()
                 
-                logger.debug("Waiting for mic data...")
+                # Block until data arrives - no timeout
+                # Pi maintains connection and sends data when streaming is enabled
                 chunk = self._mic_conn.recv(4096)
+                
                 if not chunk:
+                    # Connection closed by Pi - this is a real disconnect
                     logger.warning("Microphone connection closed by Pi, reconnecting...")
                     self._reconnect_mic()
                     continue
-                logger.debug(f"Received {len(chunk)} bytes")
+                
                 self._read_buffer += chunk
                 
-            except socket.timeout:
-                logger.warning("Mic read timeout, reconnecting...")
-                self._reconnect_mic()
-                continue
-            
             except (ConnectionError, OSError, BrokenPipeError) as e:
+                # Actual connection error - reconnect
                 logger.warning(f"Mic connection lost: {e}, reconnecting...")
                 self._reconnect_mic()
                 continue
@@ -300,7 +306,7 @@ class RemoteAudio:
         await asyncio.to_thread(self._write_sync, audio)
     
     def _write_sync(self, audio: bytes) -> None:
-        """Synchronous write with auto-reconnect"""
+        """Synchronous write with auto-reconnect on actual connection failure"""
         if self._speaker_socket is None:
             logger.warning("Speaker not connected, attempting reconnect...")
             self._reconnect_speaker()

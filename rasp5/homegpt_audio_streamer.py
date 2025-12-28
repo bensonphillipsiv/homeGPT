@@ -14,6 +14,7 @@ Usage:
 import argparse
 import logging
 import socket
+import struct
 import threading
 import time
 import signal
@@ -88,7 +89,7 @@ class HomeAssistantClient:
 
 
 class AudioStreamer:
-    """Handles bidirectional audio streaming to/from server."""
+    """Handles bidirectional audio streaming to/from server with persistent connections."""
     
     def __init__(
         self,
@@ -115,10 +116,13 @@ class AudioStreamer:
         self._mic_thread = None
         self._speaker_thread = None
         self._ha_thread = None
+        
+        # Lock for thread-safe access to streaming state
+        self._state_lock = threading.Lock()
     
     def start(self):
-        """Start audio streamer (waits for HA switch to enable streaming)."""
-        logger.info(f"Starting audio streamer")
+        """Start audio streamer with persistent connections."""
+        logger.info(f"Starting audio streamer (persistent connection mode)")
         logger.info(f"  Server: {self.server_ip}")
         logger.info(f"  Mic port: {self.mic_port} (Pi → Server)")
         logger.info(f"  Speaker port: {self.speaker_port} (Server → Pi)")
@@ -139,10 +143,10 @@ class AudioStreamer:
         if self.ha_client:
             self._start_ha_monitor()
         
-        # Start speaker listener first (server will connect to us)
+        # Start speaker listener (persistent connection)
         self._start_speaker_listener()
         
-        # Start mic sender (we connect to server)
+        # Start mic sender (persistent connection)
         self._start_mic_sender()
         
         logger.info("Audio streamer running. Press Ctrl+C to stop.")
@@ -170,18 +174,24 @@ class AudioStreamer:
             try:
                 new_state = self.ha_client.is_switch_on()
                 
-                if new_state != self._streaming_enabled:
-                    self._streaming_enabled = new_state
-                    if new_state:
-                        logger.info("HA switch ON - streaming enabled")
-                    else:
-                        logger.info("HA switch OFF - streaming disabled")
+                with self._state_lock:
+                    if new_state != self._streaming_enabled:
+                        self._streaming_enabled = new_state
+                        if new_state:
+                            logger.info("HA switch ON - audio streaming resumed")
+                        else:
+                            logger.info("HA switch OFF - audio streaming paused (connection maintained)")
                 
             except Exception as e:
                 logger.error(f"HA monitor error: {e}")
-                self._streaming_enabled = False
+                # Don't change streaming state on error - maintain current state
             
             time.sleep(HA_CHECK_INTERVAL)
+    
+    def _is_streaming_enabled(self) -> bool:
+        """Thread-safe check of streaming state."""
+        with self._state_lock:
+            return self._streaming_enabled
     
     def _start_speaker_listener(self):
         """Start thread that listens for incoming TTS audio."""
@@ -189,25 +199,20 @@ class AudioStreamer:
         self._speaker_thread.start()
     
     def _speaker_loop(self):
-        """Listen for server connection and play received audio."""
+        """Maintain persistent speaker connection, always receive and play audio."""
         while self._running:
-            # Wait for streaming to be enabled
-            if not self._streaming_enabled:
-                time.sleep(0.5)
-                continue
-            
             try:
                 # Create server socket
                 self.speaker_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.speaker_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 self.speaker_server.bind(("0.0.0.0", self.speaker_port))
                 self.speaker_server.listen(1)
-                self.speaker_server.settimeout(1.0)  # Check _running every second
+                self.speaker_server.settimeout(1.0)
                 
                 logger.info(f"Speaker listening on port {self.speaker_port}...")
                 
                 # Wait for server to connect
-                while self._running and self._streaming_enabled:
+                while self._running:
                     try:
                         self.speaker_conn, addr = self.speaker_server.accept()
                         logger.info(f"Speaker connected from {addr}")
@@ -215,9 +220,8 @@ class AudioStreamer:
                     except socket.timeout:
                         continue
                 
-                if not self._running or not self._streaming_enabled:
-                    self._cleanup_speaker()
-                    continue
+                if not self._running:
+                    break
                 
                 # Open speaker stream
                 self.speaker_stream = self.pa.open(
@@ -228,14 +232,18 @@ class AudioStreamer:
                     frames_per_buffer=CHUNK_SIZE,
                 )
                 
-                # Receive and play audio
-                while self._running and self._streaming_enabled:
+                # Always receive and play audio (server controls what it sends)
+                # Connection stays open regardless of HA switch state
+                while self._running:
                     try:
                         data = self.speaker_conn.recv(4096)
                         if not data:
                             logger.info("Speaker connection closed by server")
                             break
+                        # Always play received audio - server decides what to send
                         self.speaker_stream.write(data)
+                    except socket.timeout:
+                        continue
                     except socket.error as e:
                         logger.warning(f"Speaker socket error: {e}")
                         break
@@ -246,7 +254,7 @@ class AudioStreamer:
             finally:
                 self._cleanup_speaker()
             
-            if self._running and self._streaming_enabled:
+            if self._running:
                 logger.info("Speaker reconnecting in 2s...")
                 time.sleep(2)
     
@@ -260,6 +268,10 @@ class AudioStreamer:
                 pass
             self.speaker_stream = None
         if self.speaker_conn:
+            try:
+                self.speaker_conn.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
             try:
                 self.speaker_conn.close()
             except:
@@ -278,21 +290,18 @@ class AudioStreamer:
         self._mic_thread.start()
     
     def _mic_loop(self):
-        """Connect to server and send microphone audio."""
+        """Maintain persistent mic connection, send audio only when enabled."""
         while self._running:
-            # Wait for streaming to be enabled
-            if not self._streaming_enabled:
-                time.sleep(0.5)
-                continue
-            
             try:
                 # Connect to server
                 self.mic_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.mic_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 self.mic_socket.settimeout(10.0)
                 
                 logger.info(f"Mic connecting to {self.server_ip}:{self.mic_port}...")
                 self.mic_socket.connect((self.server_ip, self.mic_port))
-                logger.info("Mic connected to server")
+                self.mic_socket.settimeout(None)  # No timeout once connected
+                logger.info("Mic connected to server (persistent connection)")
                 
                 # Open mic stream
                 self.mic_stream = self.pa.open(
@@ -303,11 +312,17 @@ class AudioStreamer:
                     frames_per_buffer=CHUNK_SIZE,
                 )
                 
-                # Send audio while streaming is enabled
-                while self._running and self._streaming_enabled:
+                # Persistent connection loop
+                while self._running:
                     try:
+                        # Always read from mic to keep buffer clear
                         data = self.mic_stream.read(CHUNK_SIZE, exception_on_overflow=False)
-                        self.mic_socket.sendall(data)
+                        
+                        # Only send if streaming is enabled
+                        if self._is_streaming_enabled():
+                            self.mic_socket.sendall(data)
+                        # else: discard audio data but keep connection alive
+                        
                     except socket.error as e:
                         logger.warning(f"Mic socket error: {e}")
                         break
@@ -325,7 +340,7 @@ class AudioStreamer:
             finally:
                 self._cleanup_mic()
             
-            if self._running and self._streaming_enabled:
+            if self._running:
                 logger.info("Mic reconnecting in 2s...")
                 time.sleep(2)
     
@@ -340,6 +355,10 @@ class AudioStreamer:
             self.mic_stream = None
         if self.mic_socket:
             try:
+                self.mic_socket.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
+            try:
                 self.mic_socket.close()
             except:
                 pass
@@ -349,7 +368,6 @@ class AudioStreamer:
         """Stop audio streaming."""
         logger.info("Stopping audio streamer...")
         self._running = False
-        self._streaming_enabled = False
         
         # Wait for threads
         if self._mic_thread:
