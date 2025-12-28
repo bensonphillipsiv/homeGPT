@@ -1,10 +1,9 @@
 """
-Local, remote TCP, and WebSocket streaming for audio I/O.
+Local and WebSocket streaming for audio I/O.
 """
 import pyaudio
 import asyncio
 import logging
-import socket
 import struct
 import time
 from dataclasses import dataclass
@@ -23,24 +22,16 @@ logger = logging.getLogger(__name__)
 # ========== Raw Audio Classes ==========
 @dataclass
 class AudioConfig:
-    audio_type: str = "local"  # "local", "remote", or "websocket"
+    audio_type: str = "local"  # "local" or "remote"
     sample_rate: int = 16000
     channels: int = 1
     input_frames: int = 1280  # 80ms at 16kHz
 
-    # Remote TCP settings (legacy)
-    device_ip: str = "192.168.1.131"
-    listener_port: int = 4712
-    speaker_port: int = 4713
-    
-    # WebSocket settings
+    # WebSocket settings (used when audio_type="remote")
     ws_host: str = "0.0.0.0"
     ws_port: int = 8765
     ws_ping_interval: int = 20
     ws_ping_timeout: int = 10
-    
-    # Retry settings
-    retry_delay: float = 5.0
 
 
 class LocalAudio:
@@ -112,266 +103,7 @@ class LocalAudio:
 
 class RemoteAudio:
     """
-    Remote audio via TCP sockets to a Raspberry Pi running pi_audio_streamer.py
-    
-    Architecture:
-    - Microphone: Pi connects to Server:4712, sends audio
-                  Server listens on 4712, receives raw PCM
-    - Speaker:    Pi listens on 4713
-                  Server connects to Pi:4713, sends raw PCM
-    
-    Connection model: Persistent connections. Pi maintains connection even when
-    not streaming audio. Server waits indefinitely for data.
-    """
-    
-    def __init__(self, config: AudioConfig | None = None):
-        self.config = config or AudioConfig()
-        
-        # Sockets
-        self._mic_server: socket.socket | None = None
-        self._mic_conn: socket.socket | None = None
-        self._speaker_socket: socket.socket | None = None
-        
-        # Buffer for incomplete frames
-        self._read_buffer = b""
-        
-        # Frame size in bytes (16-bit mono)
-        self._frame_bytes = self.config.input_frames * 2
-        
-        self._connected = False
-    
-    async def connect(self):
-        """Establish connections for mic and speaker with retry"""
-        await asyncio.to_thread(self._connect_sync)
-    
-    def _connect_sync(self):
-        """Synchronous connection setup with retry"""
-        # === Microphone: We listen, Pi connects to us ===
-        self._connect_mic_with_retry()
-        
-        # === Speaker: We connect to Pi's listener ===
-        self._connect_speaker_with_retry()
-        
-        self._connected = True
-        logger.info("Remote audio connected")
-    
-    def _connect_mic_with_retry(self):
-        """Connect microphone with fixed retry delay"""
-        attempt = 0
-        
-        while True:
-            try:
-                # Clean up any existing socket
-                if self._mic_server:
-                    try:
-                        self._mic_server.close()
-                    except:
-                        pass
-                
-                self._mic_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self._mic_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                self._mic_server.bind(("0.0.0.0", self.config.listener_port))
-                self._mic_server.listen(1)
-                self._mic_server.settimeout(30.0)  # 30 second timeout per attempt
-                
-                logger.info(f"Waiting for Pi microphone on port {self.config.listener_port}...")
-                
-                self._mic_conn, addr = self._mic_server.accept()
-                
-                # No timeout on the connection - wait indefinitely for data
-                # Pi maintains persistent connection and sends data when streaming is enabled
-                self._mic_conn.settimeout(None)
-                
-                logger.info(f"Microphone connected from {addr} (persistent connection mode)")
-                
-                # Success
-                return
-                
-            except socket.timeout:
-                attempt += 1
-                logger.warning(
-                    f"Timeout waiting for Pi microphone (attempt {attempt}). "
-                    f"Retrying in {self.config.retry_delay}s..."
-                )
-                time.sleep(self.config.retry_delay)
-                
-            except Exception as e:
-                attempt += 1
-                logger.error(
-                    f"Mic connection error: {e} (attempt {attempt}). "
-                    f"Retrying in {self.config.retry_delay}s..."
-                )
-                time.sleep(self.config.retry_delay)
-    
-    def _connect_speaker_with_retry(self):
-        """Connect speaker with fixed retry delay"""
-        attempt = 0
-        
-        while True:
-            try:
-                # Clean up any existing socket
-                if self._speaker_socket:
-                    try:
-                        self._speaker_socket.close()
-                    except:
-                        pass
-                
-                self._speaker_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self._speaker_socket.settimeout(10.0)
-                
-                logger.info(
-                    f"Connecting to Pi speaker at "
-                    f"{self.config.device_ip}:{self.config.speaker_port}..."
-                )
-                
-                self._speaker_socket.connect((self.config.device_ip, self.config.speaker_port))
-                self._speaker_socket.settimeout(None)  # No timeout for sends
-                logger.info("Speaker connected (persistent connection mode)")
-                
-                # Success
-                return
-                
-            except (socket.timeout, ConnectionRefusedError, OSError) as e:
-                attempt += 1
-                logger.warning(
-                    f"Speaker connection failed: {e} (attempt {attempt}). "
-                    f"Retrying in {self.config.retry_delay}s..."
-                )
-                time.sleep(self.config.retry_delay)
-                
-            except Exception as e:
-                attempt += 1
-                logger.error(
-                    f"Speaker connection error: {e} (attempt {attempt}). "
-                    f"Retrying in {self.config.retry_delay}s..."
-                )
-                time.sleep(self.config.retry_delay)
-    
-    async def read(self) -> bytes:
-        """Read one frame of audio from Pi's microphone"""
-        if not self._connected or self._mic_conn is None:
-            raise RuntimeError("Remote audio not connected")
-        
-        return await asyncio.to_thread(self._read_sync)
-    
-    def _read_sync(self) -> bytes:
-        """Synchronous read with buffering. Waits indefinitely for data."""
-        while len(self._read_buffer) < self._frame_bytes:
-            try:
-                if self._mic_conn is None:
-                    self._reconnect_mic()
-                
-                # Block until data arrives - no timeout
-                # Pi maintains connection and sends data when streaming is enabled
-                chunk = self._mic_conn.recv(4096)
-                
-                if not chunk:
-                    # Connection closed by Pi - this is a real disconnect
-                    logger.warning("Microphone connection closed by Pi, reconnecting...")
-                    self._reconnect_mic()
-                    continue
-                
-                self._read_buffer += chunk
-                
-            except (ConnectionError, OSError, BrokenPipeError) as e:
-                # Actual connection error - reconnect
-                logger.warning(f"Mic connection lost: {e}, reconnecting...")
-                self._reconnect_mic()
-                continue
-        
-        # Extract one frame
-        frame = self._read_buffer[:self._frame_bytes]
-        self._read_buffer = self._read_buffer[self._frame_bytes:]
-        return frame
-    
-    def _reconnect_mic(self):
-        """Reconnect microphone with retry"""
-        # Close existing connections
-        if self._mic_conn:
-            try:
-                self._mic_conn.close()
-            except:
-                pass
-            self._mic_conn = None
-        
-        if self._mic_server:
-            try:
-                self._mic_server.close()
-            except:
-                pass
-            self._mic_server = None
-        
-        # Clear buffer
-        self._read_buffer = b""
-        
-        # Reconnect
-        self._connect_mic_with_retry()
-    
-    async def write(self, audio: bytes) -> None:
-        """Write audio to Pi's speaker"""
-        if not self._connected or self._speaker_socket is None:
-            raise RuntimeError("Remote audio not connected")
-        
-        await asyncio.to_thread(self._write_sync, audio)
-    
-    def _write_sync(self, audio: bytes) -> None:
-        """Synchronous write with auto-reconnect on actual connection failure"""
-        if self._speaker_socket is None:
-            logger.warning("Speaker not connected, attempting reconnect...")
-            self._reconnect_speaker()
-        
-        try:
-            self._speaker_socket.sendall(audio)
-        except (BrokenPipeError, ConnectionResetError, OSError) as e:
-            logger.warning(f"Speaker write failed: {e}, reconnecting...")
-            self._reconnect_speaker()
-            # Try once more after reconnect
-            try:
-                if self._speaker_socket:
-                    self._speaker_socket.sendall(audio)
-            except Exception as e2:
-                logger.error(f"Speaker write failed after reconnect: {e2}")
-    
-    def _reconnect_speaker(self):
-        """Reconnect speaker with retry"""
-        if self._speaker_socket:
-            try:
-                self._speaker_socket.close()
-            except:
-                pass
-            self._speaker_socket = None
-        
-        # Reconnect
-        self._connect_speaker_with_retry()
-    
-    def write_sync(self, audio: bytes) -> None:
-        """Write audio synchronously (used by TTS)"""
-        if not self._connected:
-            return
-        self._write_sync(audio)
-    
-    async def close(self):
-        """Close all connections"""
-        self._connected = False
-        
-        for sock in [self._mic_conn, self._mic_server, self._speaker_socket]:
-            if sock:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-        
-        self._mic_conn = None
-        self._mic_server = None
-        self._speaker_socket = None
-        self._read_buffer = b""
-        
-        logger.info("Remote audio closed")
-
-
-class WebSocketAudio:
-    """
-    WebSocket-based audio I/O - more reliable through K8s/MetalLB.
+    WebSocket-based remote audio I/O for Raspberry Pi.
     
     Single WebSocket connection handles both mic input and speaker output.
     Messages are prefixed with a type byte:
@@ -527,19 +259,17 @@ class WebSocketAudio:
 
 
 class Audio:
-    """Unified audio interface for local, remote TCP, or WebSocket audio"""
+    """Unified audio interface for local or remote (WebSocket) audio"""
     
     def __init__(self, config: AudioConfig | None = None):
         self.config = config or AudioConfig()
-        self._backend: LocalAudio | RemoteAudio | WebSocketAudio | None = None
+        self._backend: LocalAudio | RemoteAudio | None = None
     
     async def connect(self) -> None:
         if self.config.audio_type == "local":
             self._backend = LocalAudio(self.config)
         elif self.config.audio_type == "remote":
             self._backend = RemoteAudio(self.config)
-        elif self.config.audio_type == "websocket":
-            self._backend = WebSocketAudio(self.config)
         else:
             raise ValueError(f"Unsupported audio type: {self.config.audio_type}")
         
