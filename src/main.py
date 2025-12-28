@@ -47,9 +47,7 @@ async def main():
     audio = Audio(audio_config)
     
     if config.audio_type == "remote":
-        logger.info(f"Remote audio config:")
-        logger.info(f"  Mic port: {config.audio_listener_port} (server listens)")
-        logger.info(f"  Speaker port: {config.audio_speaker_port} (Pi listens)")
+        logger.info(f"Remote audio configured on port {config.audio_ws_port}")
 
     wakeword = OpenWakeWordDetector()
 
