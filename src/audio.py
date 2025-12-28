@@ -158,24 +158,22 @@ class RemoteAudio:
     
     async def _process_write_queue(self):
         """Process queued audio for writing."""
-        logger.info("Write queue processor started")  # ADD THIS
+        logger.info("Write queue processor started")
         while self._running:
             try:
                 audio = await asyncio.wait_for(self._write_queue.get(), timeout=1.0)
-                
-                logger.info(f"Dequeued {len(audio)} bytes to send")  # ADD THIS
                 
                 if self._client_ws is not None:
                     try:
                         message = bytes([self.MSG_SPEAKER]) + audio
                         await self._client_ws.send(message)
-                        logger.info(f"Sent {len(message)} bytes to client")  # ADD THIS
+                        logger.debug(f"Sent {len(message)} bytes to client")
                     except websockets.exceptions.ConnectionClosed:
                         logger.warning("Cannot write - client disconnected")
                     except Exception as e:
                         logger.warning(f"Write error: {e}")
                 else:
-                    logger.warning("No client connected, dropping audio")  # ADD THIS
+                    logger.warning("No client connected, dropping audio")
                         
             except asyncio.TimeoutError:
                 continue
@@ -223,19 +221,29 @@ class RemoteAudio:
                 except:
                     pass
             self._read_buffer = b""
-            logger.info(f"Client {client_addr} cleaned up, waiting for reconnection...")
+            logger.info(f"Client {client_addr} cleaned up, ready for new connections")
+            # DON'T wait here - just return and let new connections come in
     
     async def read(self) -> bytes:
         """Read one frame of audio from the client."""
         # Wait for connection if not connected
         if self._client_ws is None:
+            logger.info("Waiting for client to reconnect...")
             await self._connected.wait()
         
         # Buffer until we have a full frame
         while len(self._read_buffer) < self._frame_bytes:
             try:
-                chunk = await self._read_queue.get()
-                self._read_buffer += chunk
+                # Use timeout to periodically check connection status
+                try:
+                    chunk = await asyncio.wait_for(self._read_queue.get(), timeout=1.0)
+                    self._read_buffer += chunk
+                except asyncio.TimeoutError:
+                    # Check if still connected
+                    if self._client_ws is None:
+                        logger.info("Client disconnected during read, waiting for reconnect...")
+                        await self._connected.wait()
+                    continue
             except Exception as e:
                 logger.warning(f"Read queue error: {e}")
                 await asyncio.sleep(0.01)
@@ -251,25 +259,19 @@ class RemoteAudio:
             return
         
         try:
-            # Prefix with message type
             message = bytes([self.MSG_SPEAKER]) + audio
             await self._client_ws.send(message)
         except websockets.exceptions.ConnectionClosed:
             logger.warning("Cannot write - client disconnected")
         except Exception as e:
             logger.warning(f"Write error: {e}")
-
+    
     def write_sync(self, audio: bytes) -> None:
         """Synchronous write wrapper for TTS compatibility."""
-        if self._client_ws is None:
-            logger.warning("write_sync: No client connected")  # ADD THIS
-            return
-        if self._loop is None:
-            logger.warning("write_sync: No event loop")  # ADD THIS
+        if self._client_ws is None or self._loop is None:
             return
         
         try:
-            logger.info(f"write_sync: Queueing {len(audio)} bytes")  # ADD THIS
             self._loop.call_soon_threadsafe(
                 self._write_queue.put_nowait, audio
             )
@@ -296,7 +298,6 @@ class RemoteAudio:
             self._server.close()
             await self._server.wait_closed()
         logger.info("WebSocket audio server closed")
-
 
 class Audio:
     """Unified audio interface for local or remote (WebSocket) audio"""

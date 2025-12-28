@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 """
 HomeGPT Raspberry Pi Audio Streamer - WebSocket Version
-
-More reliable than raw TCP sockets through K8s/MetalLB.
-
-Usage:
-    uv run pi_audio_ws.py
-    uv run pi_audio_ws.py --server ws://192.168.1.100:8765
 """
 
 import argparse
@@ -17,6 +11,7 @@ import signal
 import sys
 import threading
 import time
+import queue
 
 import pyaudio
 import requests
@@ -90,10 +85,15 @@ class WebSocketAudioStreamer:
         self.websocket = None
         
         self._running = False
-        self._streaming_enabled = True  # Default to enabled
+        self._connected = False
+        self._streaming_enabled = True
         self._state_lock = threading.Lock()
         
-        # Silence frame for when streaming is disabled
+        # Queues for thread-safe audio transfer
+        self._mic_queue = queue.Queue(maxsize=100)
+        self._speaker_queue = queue.Queue(maxsize=100)
+        
+        # Silence frame
         self._silence_frame = b'\x00' * (CHUNK_SIZE * 2)
     
     def _is_streaming_enabled(self) -> bool:
@@ -109,6 +109,50 @@ class WebSocketAudioStreamer:
                 else:
                     logger.info("HA switch OFF - sending silence")
     
+    def _mic_reader_thread(self):
+        """Thread that reads from microphone and queues audio."""
+        logger.info("Mic reader thread started")
+        while self._running:
+            try:
+                if self.mic_stream:
+                    data = self.mic_stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                    
+                    if self._is_streaming_enabled():
+                        audio = data
+                    else:
+                        audio = self._silence_frame
+                    
+                    try:
+                        self._mic_queue.put_nowait(audio)
+                    except queue.Full:
+                        # Drop oldest frame if queue is full
+                        try:
+                            self._mic_queue.get_nowait()
+                            self._mic_queue.put_nowait(audio)
+                        except:
+                            pass
+                else:
+                    time.sleep(0.01)
+            except Exception as e:
+                logger.error(f"Mic reader error: {e}")
+                time.sleep(0.1)
+        logger.info("Mic reader thread ended")
+    
+    def _speaker_writer_thread(self):
+        """Thread that plays audio from queue to speaker."""
+        logger.info("Speaker writer thread started")
+        while self._running:
+            try:
+                audio = self._speaker_queue.get(timeout=0.5)
+                if self.speaker_stream:
+                    self.speaker_stream.write(audio)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Speaker writer error: {e}")
+                time.sleep(0.1)
+        logger.info("Speaker writer thread ended")
+    
     async def _ha_monitor(self):
         """Monitor Home Assistant switch state."""
         while self._running:
@@ -121,24 +165,17 @@ class WebSocketAudioStreamer:
             await asyncio.sleep(HA_CHECK_INTERVAL)
     
     async def _send_audio(self):
-        """Read from mic and send to server."""
+        """Send mic audio from queue to server."""
         logger.info("Send audio task started")
         try:
-            while self._running and self.websocket:
+            while self._running and self.websocket and self._connected:
                 try:
-                    if self.mic_stream:
-                        # Always read to keep buffer clear
-                        data = self.mic_stream.read(CHUNK_SIZE, exception_on_overflow=False)
-                        
-                        if self._is_streaming_enabled():
-                            # Send real audio
-                            message = bytes([MSG_MIC]) + data
-                        else:
-                            # Send silence
-                            message = bytes([MSG_MIC]) + self._silence_frame
-                        
+                    # Non-blocking get from queue
+                    try:
+                        audio = self._mic_queue.get_nowait()
+                        message = bytes([MSG_MIC]) + audio
                         await self.websocket.send(message)
-                    else:
+                    except queue.Empty:
                         await asyncio.sleep(0.01)
                         
                 except websockets.exceptions.ConnectionClosed as e:
@@ -151,35 +188,34 @@ class WebSocketAudioStreamer:
             logger.info("Send audio task ended")
     
     async def _receive_audio(self):
-        """Receive audio from server and play."""
+        """Receive audio from server and queue for playback."""
         logger.info("Receive audio task started")
         try:
-            while self._running and self.websocket:
+            while self._running and self.websocket and self._connected:
                 try:
                     message = await asyncio.wait_for(
                         self.websocket.recv(),
-                        timeout=30.0
+                        timeout=1.0
                     )
                     
                     if isinstance(message, bytes) and len(message) > 0:
                         msg_type = message[0]
                         payload = message[1:]
                         
-                        logger.info(f"Received message type={msg_type}, payload_len={len(payload)}")  # ADD THIS
-                        
-                        if msg_type == MSG_SPEAKER and self.speaker_stream:
-                            logger.info(f"Playing {len(payload)} bytes of audio")  # ADD THIS
-                            self.speaker_stream.write(payload)
-                    else:
-                        logger.warning(f"Received non-bytes or empty: {type(message)}")  # ADD THIS
-                            
+                        if msg_type == MSG_SPEAKER:
+                            logger.info(f"Received speaker audio: {len(payload)} bytes")
+                            try:
+                                self._speaker_queue.put_nowait(payload)
+                            except queue.Full:
+                                logger.warning("Speaker queue full, dropping audio")
+                                
                 except asyncio.TimeoutError:
                     continue
                 except websockets.exceptions.ConnectionClosed as e:
                     logger.warning(f"Receive: Connection closed: {e}")
                     break
                 except Exception as e:
-                    logger.error(f"Receive error: {e}", exc_info=True)  # ADD exc_info
+                    logger.error(f"Receive error: {e}")
                     await asyncio.sleep(0.1)
         finally:
             logger.info("Receive audio task ended")
@@ -191,7 +227,7 @@ class WebSocketAudioStreamer:
         if self.pa is None:
             self.pa = pyaudio.PyAudio()
         
-        # Close existing streams if any
+        # Close existing streams
         if self.mic_stream:
             try:
                 self.mic_stream.stop_stream()
@@ -237,21 +273,30 @@ class WebSocketAudioStreamer:
                 close_timeout=5,
             )
             
+            self._connected = True
             logger.info("WebSocket connected!")
             return True
             
         except Exception as e:
             logger.warning(f"Connection failed: {e}")
+            self._connected = False
             return False
     
     async def run(self):
         """Main run loop with automatic reconnection."""
         self._running = True
         
-        # Initialize audio once
+        # Initialize audio
         self._init_audio()
         
-        # Start HA monitor if configured
+        # Start audio threads
+        mic_thread = threading.Thread(target=self._mic_reader_thread, daemon=True)
+        mic_thread.start()
+        
+        speaker_thread = threading.Thread(target=self._speaker_writer_thread, daemon=True)
+        speaker_thread.start()
+        
+        # Start HA monitor
         ha_task = None
         if self.ha_client:
             ha_task = asyncio.create_task(self._ha_monitor())
@@ -260,7 +305,7 @@ class WebSocketAudioStreamer:
         
         logger.info("Audio streamer running...")
         
-        # Main loop with reconnection
+        # Main loop
         while self._running:
             try:
                 if await self._connect():
@@ -268,18 +313,19 @@ class WebSocketAudioStreamer:
                     send_task = asyncio.create_task(self._send_audio())
                     recv_task = asyncio.create_task(self._receive_audio())
                     
-                    # Wait for either to complete (usually due to disconnect)
                     done, pending = await asyncio.wait(
                         [send_task, recv_task],
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     
-                    # Log which task finished
                     for task in done:
-                        if task.exception():
-                            logger.error(f"Task failed with: {task.exception()}")
+                        try:
+                            exc = task.exception()
+                            if exc:
+                                logger.error(f"Task failed: {exc}")
+                        except:
+                            pass
                     
-                    # Cancel the other task
                     for task in pending:
                         task.cancel()
                         try:
@@ -287,7 +333,7 @@ class WebSocketAudioStreamer:
                         except asyncio.CancelledError:
                             pass
                     
-                    # Close websocket
+                    self._connected = False
                     if self.websocket:
                         try:
                             await self.websocket.close()
@@ -303,7 +349,7 @@ class WebSocketAudioStreamer:
                 logger.error(f"Run loop error: {e}")
                 await asyncio.sleep(2)
         
-        # Cancel HA monitor
+        # Cleanup
         if ha_task:
             ha_task.cancel()
             try:
@@ -311,12 +357,13 @@ class WebSocketAudioStreamer:
             except asyncio.CancelledError:
                 pass
         
-        # Cleanup
         self._cleanup()
     
     def _cleanup(self):
         """Clean up resources."""
         logger.info("Cleaning up...")
+        self._running = False
+        
         if self.mic_stream:
             try:
                 self.mic_stream.stop_stream()
@@ -324,6 +371,7 @@ class WebSocketAudioStreamer:
             except:
                 pass
             self.mic_stream = None
+        
         if self.speaker_stream:
             try:
                 self.speaker_stream.stop_stream()
@@ -331,12 +379,14 @@ class WebSocketAudioStreamer:
             except:
                 pass
             self.speaker_stream = None
+        
         if self.pa:
             try:
                 self.pa.terminate()
             except:
                 pass
             self.pa = None
+        
         logger.info("Audio streamer stopped")
     
     def stop(self):
@@ -348,7 +398,6 @@ class WebSocketAudioStreamer:
 async def main_async(server_url: str, ha_client: HomeAssistantClient | None):
     streamer = WebSocketAudioStreamer(server_url, ha_client)
     
-    # Handle shutdown
     loop = asyncio.get_event_loop()
     
     def signal_handler():
@@ -363,7 +412,7 @@ async def main_async(server_url: str, ha_client: HomeAssistantClient | None):
 
 def main():
     parser = argparse.ArgumentParser(description="HomeGPT Pi Audio Streamer (WebSocket)")
-    parser.add_argument("--server", "-s", help="WebSocket server URL (e.g., ws://192.168.1.100:8765)")
+    parser.add_argument("--server", "-s", help="WebSocket server URL")
     parser.add_argument("--ha-url", help="Home Assistant URL")
     parser.add_argument("--ha-token", help="Home Assistant token")
     parser.add_argument("--ha-entity", help="HA entity ID")
@@ -374,7 +423,7 @@ def main():
     server_url = args.server or os.environ.get("WS_SERVER_URL") or (f"ws://{server_ip}:{server_port}" if server_ip else None)
     
     if not server_url:
-        logger.error("Server URL required. Set SERVER_IP or WS_SERVER_URL in .env or use --server")
+        logger.error("Server URL required")
         sys.exit(1)
     
     ha_url = args.ha_url or os.environ.get("HOMEASSISTANT_URL")
@@ -384,7 +433,7 @@ def main():
     ha_client = None
     if ha_url and ha_token:
         ha_client = HomeAssistantClient(ha_url, ha_token, ha_entity)
-        logger.info(f"Home Assistant control enabled")
+        logger.info("Home Assistant control enabled")
     else:
         logger.info("No HA credentials - always streaming")
     
