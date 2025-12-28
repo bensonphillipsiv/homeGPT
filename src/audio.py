@@ -245,17 +245,17 @@ class RemoteAudio:
                 if self._mic_conn is None:
                     self._reconnect_mic()
                 
+                logger.debug("Waiting for mic data...")
                 chunk = self._mic_conn.recv(4096)
                 if not chunk:
                     logger.warning("Microphone connection closed by Pi, reconnecting...")
                     self._reconnect_mic()
                     continue
+                logger.debug(f"Received {len(chunk)} bytes")
                 self._read_buffer += chunk
                 
             except socket.timeout:
-                logger.warning(
-                    f"Mic read timeout {self._consecutive_timeouts} times, reconnecting..."
-                )
+                logger.warning("Mic read timeout, reconnecting...")
                 self._reconnect_mic()
                 continue
             
