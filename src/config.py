@@ -20,9 +20,7 @@ class Config:
     
     # Audio device settings
     audio_type: Literal["local", "remote"]
-    audio_device_ip: str
-    audio_listener_port: int
-    audio_speaker_port: int
+    audio_ws_port: int
 
     # Model paths
     whisper_model: str
@@ -56,9 +54,7 @@ def load_config() -> Config:
         
         # Audio
         audio_type=os.getenv("AUDIO_TYPE", "remote"),
-        audio_device_ip=os.getenv("AUDIO_DEVICE_IP", "192.168.1.131"),
-        audio_listener_port=int(os.getenv("AUDIO_LISTENER_PORT", "4712")),
-        audio_speaker_port=int(os.getenv("AUDIO_SPEAKER_PORT", "4713")),
+        audio_ws_port=os.getenv("audio_ws_port", "8765"),
         
         # Models
         whisper_model=os.getenv("WHISPER_MODEL", "base.en"),

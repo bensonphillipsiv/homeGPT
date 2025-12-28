@@ -42,9 +42,7 @@ async def main():
     # Initialize audio with config
     audio_config = AudioConfig(
         audio_type=config.audio_type,
-        device_ip=config.audio_device_ip,
-        listener_port=config.audio_listener_port,
-        speaker_port=config.audio_speaker_port,
+        ws_port=config.audio_ws_port
     )
     audio = Audio(audio_config)
     
