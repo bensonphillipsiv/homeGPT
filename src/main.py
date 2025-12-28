@@ -48,7 +48,6 @@ async def main():
     
     if config.audio_type == "remote":
         logger.info(f"Remote audio config:")
-        logger.info(f"  Pi IP: {config.audio_device_ip}")
         logger.info(f"  Mic port: {config.audio_listener_port} (server listens)")
         logger.info(f"  Speaker port: {config.audio_speaker_port} (Pi listens)")
 
