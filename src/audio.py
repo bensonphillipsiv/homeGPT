@@ -1,5 +1,5 @@
 """
-Local and remote TCP streaming for audio I/O.
+Local, remote TCP, and WebSocket streaming for audio I/O.
 """
 import pyaudio
 import asyncio
@@ -14,21 +14,30 @@ from piper.voice import PiperVoice
 import numpy as np
 import webrtcvad
 from openwakeword.model import Model as OWWModel
+import websockets
+from websockets.server import serve
 
 logger = logging.getLogger(__name__)
+
 
 # ========== Raw Audio Classes ==========
 @dataclass
 class AudioConfig:
-    audio_type: str = "local"  # "local" or "remote"
+    audio_type: str = "local"  # "local", "remote", or "websocket"
     sample_rate: int = 16000
     channels: int = 1
     input_frames: int = 1280  # 80ms at 16kHz
 
-    # Remote settings (TCP streaming to/from Raspberry Pi)
+    # Remote TCP settings (legacy)
     device_ip: str = "192.168.1.131"
-    listener_port: int = 4712   # Server listens for mic audio from Pi
-    speaker_port: int = 4713    # Server connects to Pi's speaker listener
+    listener_port: int = 4712
+    speaker_port: int = 4713
+    
+    # WebSocket settings
+    ws_host: str = "0.0.0.0"
+    ws_port: int = 8765
+    ws_ping_interval: int = 20
+    ws_ping_timeout: int = 10
     
     # Retry settings
     retry_delay: float = 5.0
@@ -334,21 +343,6 @@ class RemoteAudio:
         
         # Reconnect
         self._connect_speaker_with_retry()
-        
-        # Play reconnect beep
-        self._play_alert_sync()
-    
-    def _play_alert_sync(self):
-        """Play alert sound synchronously"""
-        try:
-            duration = 0.15
-            t = np.linspace(0, duration, int(self.config.sample_rate * duration), endpoint=False)
-            freq = 800
-            sound = np.sin(2 * np.pi * freq * t) * np.exp(-4 * t) * 0.3
-            audio_bytes = (sound * 32767).astype(np.int16).tobytes()
-            self._write_sync(audio_bytes)
-        except Exception as e:
-            logger.warning(f"Failed to play reconnect beep: {e}")
     
     def write_sync(self, audio: bytes) -> None:
         """Write audio synchronously (used by TTS)"""
@@ -375,18 +369,177 @@ class RemoteAudio:
         logger.info("Remote audio closed")
 
 
-class Audio:
-    """Unified audio interface for local or remote audio"""
+class WebSocketAudio:
+    """
+    WebSocket-based audio I/O - more reliable through K8s/MetalLB.
+    
+    Single WebSocket connection handles both mic input and speaker output.
+    Messages are prefixed with a type byte:
+      - 0x01: Mic audio (Pi -> Server)
+      - 0x02: Speaker audio (Server -> Pi)
+      - 0x03: Control message (JSON)
+    """
+    
+    MSG_MIC = 0x01
+    MSG_SPEAKER = 0x02
+    MSG_CONTROL = 0x03
     
     def __init__(self, config: AudioConfig | None = None):
         self.config = config or AudioConfig()
-        self._backend: LocalAudio | RemoteAudio | None = None
+        self._server = None
+        self._client_ws = None
+        self._connected = asyncio.Event()
+        self._read_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._frame_bytes = self.config.input_frames * 2  # 16-bit audio
+        self._read_buffer = b""
+        self._running = False
+        self._handler_task = None
+        self._loop = None
+    
+    async def connect(self):
+        """Start WebSocket server and wait for client connection."""
+        self._running = True
+        self._loop = asyncio.get_event_loop()
+        
+        self._server = await serve(
+            self._handle_client,
+            self.config.ws_host,
+            self.config.ws_port,
+            ping_interval=self.config.ws_ping_interval,
+            ping_timeout=self.config.ws_ping_timeout,
+        )
+        
+        logger.info(f"WebSocket audio server listening on ws://{self.config.ws_host}:{self.config.ws_port}")
+        logger.info("Waiting for Pi to connect...")
+        
+        # Wait for client to connect
+        await self._connected.wait()
+        
+        logger.info("WebSocket audio connected")
+    
+    async def _handle_client(self, websocket):
+        """Handle incoming WebSocket connection."""
+        client_addr = websocket.remote_address
+        logger.info(f"Client connected from {client_addr}")
+        
+        # Only allow one client at a time
+        if self._client_ws is not None:
+            logger.warning(f"Rejecting connection from {client_addr} - already have a client")
+            await websocket.close(1008, "Only one client allowed")
+            return
+        
+        self._client_ws = websocket
+        self._connected.set()
+        
+        try:
+            async for message in websocket:
+                if isinstance(message, bytes) and len(message) > 0:
+                    msg_type = message[0]
+                    payload = message[1:]
+                    
+                    if msg_type == self.MSG_MIC:
+                        # Queue mic audio for reading
+                        await self._read_queue.put(payload)
+                    elif msg_type == self.MSG_CONTROL:
+                        # Handle control messages (future use)
+                        logger.debug(f"Control message: {payload.decode()}")
+                        
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.warning(f"Client disconnected: {e}")
+        except Exception as e:
+            logger.error(f"WebSocket handler error: {e}")
+        finally:
+            self._client_ws = None
+            self._connected.clear()
+            # Clear any pending audio
+            while not self._read_queue.empty():
+                try:
+                    self._read_queue.get_nowait()
+                except:
+                    pass
+            self._read_buffer = b""
+            logger.info(f"Client {client_addr} cleaned up, waiting for reconnection...")
+            
+            # Wait for reconnection if still running
+            if self._running:
+                logger.info("Waiting for Pi to reconnect...")
+                await self._connected.wait()
+    
+    async def read(self) -> bytes:
+        """Read one frame of audio from the client."""
+        # Wait for connection if not connected
+        if self._client_ws is None:
+            await self._connected.wait()
+        
+        # Buffer until we have a full frame
+        while len(self._read_buffer) < self._frame_bytes:
+            try:
+                chunk = await self._read_queue.get()
+                self._read_buffer += chunk
+            except Exception as e:
+                logger.warning(f"Read queue error: {e}")
+                await asyncio.sleep(0.01)
+        
+        # Extract one frame
+        frame = self._read_buffer[:self._frame_bytes]
+        self._read_buffer = self._read_buffer[self._frame_bytes:]
+        return frame
+    
+    async def write(self, audio: bytes) -> None:
+        """Write audio to the client's speaker."""
+        if self._client_ws is None:
+            return
+        
+        try:
+            # Prefix with message type
+            message = bytes([self.MSG_SPEAKER]) + audio
+            await self._client_ws.send(message)
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning("Cannot write - client disconnected")
+        except Exception as e:
+            logger.warning(f"Write error: {e}")
+    
+    def write_sync(self, audio: bytes) -> None:
+        """Synchronous write wrapper for TTS compatibility."""
+        if self._client_ws is None or self._loop is None:
+            return
+        
+        try:
+            # Schedule the async write from sync context
+            future = asyncio.run_coroutine_threadsafe(self.write(audio), self._loop)
+            # Wait for completion with timeout
+            future.result(timeout=1.0)
+        except Exception as e:
+            logger.warning(f"Sync write failed: {e}")
+    
+    async def close(self):
+        """Close the server."""
+        self._running = False
+        if self._client_ws:
+            try:
+                await self._client_ws.close()
+            except:
+                pass
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+        logger.info("WebSocket audio server closed")
+
+
+class Audio:
+    """Unified audio interface for local, remote TCP, or WebSocket audio"""
+    
+    def __init__(self, config: AudioConfig | None = None):
+        self.config = config or AudioConfig()
+        self._backend: LocalAudio | RemoteAudio | WebSocketAudio | None = None
     
     async def connect(self) -> None:
         if self.config.audio_type == "local":
             self._backend = LocalAudio(self.config)
         elif self.config.audio_type == "remote":
             self._backend = RemoteAudio(self.config)
+        elif self.config.audio_type == "websocket":
+            self._backend = WebSocketAudio(self.config)
         else:
             raise ValueError(f"Unsupported audio type: {self.config.audio_type}")
         

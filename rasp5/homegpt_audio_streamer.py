@@ -1,47 +1,49 @@
 #!/usr/bin/env python3
 """
-HomeGPT Raspberry Pi Audio Streamer
+HomeGPT Raspberry Pi Audio Streamer - WebSocket Version
 
-Streams microphone audio to server and receives TTS audio back.
-Uses PyAudio for audio I/O and TCP sockets for network transport.
-Controlled by Home Assistant switch.homegpt entity.
+More reliable than raw TCP sockets through K8s/MetalLB.
 
 Usage:
-    uv run pi_audio_streamer.py
-    uv run pi_audio_streamer.py --server 192.168.1.100
+    uv run pi_audio_ws.py
+    uv run pi_audio_ws.py --server ws://192.168.1.100:8765
 """
 
 import argparse
+import asyncio
 import logging
-import socket
-import struct
-import threading
-import time
+import os
 import signal
 import sys
-import os
+import threading
+import time
 
 import pyaudio
 import requests
+import websockets
 from dotenv import load_dotenv
 
-# Load .env file
 load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger("pi-audio")
+logger = logging.getLogger("pi-audio-ws")
 
-# Audio settings (must match server)
+# Audio settings
 SAMPLE_RATE = 16000
 CHANNELS = 1
 FORMAT = pyaudio.paInt16
 CHUNK_SIZE = 1280  # 80ms at 16kHz
 
+# Message types (must match server)
+MSG_MIC = 0x01
+MSG_SPEAKER = 0x02
+MSG_CONTROL = 0x03
+
 # Home Assistant settings
-HA_CHECK_INTERVAL = 5.0  # seconds
+HA_CHECK_INTERVAL = 5.0
 HA_ENTITY_ID = os.environ.get("HA_ENTITY", "input_boolean.homegpt")
 
 
@@ -58,390 +60,262 @@ class HomeAssistantClient:
         }
     
     def is_switch_on(self) -> bool:
-        """Check if the Home Assistant switch is on.
-        
-        Returns False if:
-        - Switch is off
-        - Request fails
-        - Entity not found
-        - Any error occurs
-        """
+        """Check if the Home Assistant switch is on."""
         try:
             url = f"{self.ha_url}/api/states/{self.entity_id}"
             response = requests.get(url, headers=self._headers, timeout=5.0)
-            
             if response.status_code == 200:
                 state = response.json().get("state", "off")
                 return state.lower() == "on"
-            else:
-                logger.warning(f"HA API returned status {response.status_code}")
-                return False
-                
-        except requests.exceptions.Timeout:
-            logger.warning("HA API request timed out")
-            return False
-        except requests.exceptions.ConnectionError:
-            logger.warning("HA API connection failed")
             return False
         except Exception as e:
-            logger.error(f"HA API error: {e}")
+            logger.warning(f"HA check failed: {e}")
             return False
 
 
-class AudioStreamer:
-    """Handles bidirectional audio streaming to/from server with persistent connections."""
+class WebSocketAudioStreamer:
+    """WebSocket-based audio streamer with automatic reconnection."""
     
     def __init__(
         self,
-        server_ip: str,
-        mic_port: int = 4712,
-        speaker_port: int = 4713,
+        server_url: str,
         ha_client: HomeAssistantClient | None = None,
     ):
-        self.server_ip = server_ip
-        self.mic_port = mic_port
-        self.speaker_port = speaker_port
+        self.server_url = server_url
         self.ha_client = ha_client
         
         self.pa = None
         self.mic_stream = None
         self.speaker_stream = None
-        
-        self.mic_socket = None
-        self.speaker_server = None
-        self.speaker_conn = None
+        self.websocket = None
         
         self._running = False
-        self._streaming_enabled = False  # Controlled by HA switch
-        self._mic_thread = None
-        self._speaker_thread = None
-        self._ha_thread = None
-        
-        # Lock for thread-safe access to streaming state
+        self._streaming_enabled = False
         self._state_lock = threading.Lock()
+        
+        # Silence frame for when streaming is disabled
+        self._silence_frame = b'\x00' * (CHUNK_SIZE * 2)
     
-    def start(self):
-        """Start audio streamer with persistent connections."""
-        logger.info(f"Starting audio streamer (persistent connection mode)")
-        logger.info(f"  Server: {self.server_ip}")
-        logger.info(f"  Mic port: {self.mic_port} (Pi → Server)")
-        logger.info(f"  Speaker port: {self.speaker_port} (Server → Pi)")
+    def _is_streaming_enabled(self) -> bool:
+        with self._state_lock:
+            return self._streaming_enabled
+    
+    def _set_streaming_enabled(self, value: bool):
+        with self._state_lock:
+            if value != self._streaming_enabled:
+                self._streaming_enabled = value
+                if value:
+                    logger.info("HA switch ON - sending real audio")
+                else:
+                    logger.info("HA switch OFF - sending silence")
+    
+    async def _ha_monitor(self):
+        """Monitor Home Assistant switch state."""
+        while self._running:
+            try:
+                if self.ha_client:
+                    new_state = self.ha_client.is_switch_on()
+                    self._set_streaming_enabled(new_state)
+            except Exception as e:
+                logger.error(f"HA monitor error: {e}")
+            await asyncio.sleep(HA_CHECK_INTERVAL)
+    
+    async def _send_audio(self):
+        """Read from mic and send to server."""
+        while self._running:
+            try:
+                if self.mic_stream and self.websocket:
+                    # Always read to keep buffer clear
+                    data = self.mic_stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                    
+                    if self._is_streaming_enabled():
+                        # Send real audio
+                        message = bytes([MSG_MIC]) + data
+                    else:
+                        # Send silence
+                        message = bytes([MSG_MIC]) + self._silence_frame
+                    
+                    await self.websocket.send(message)
+                else:
+                    await asyncio.sleep(0.01)
+                    
+            except Exception as e:
+                logger.warning(f"Send error: {e}")
+                await asyncio.sleep(0.1)
+    
+    async def _receive_audio(self):
+        """Receive audio from server and play."""
+        while self._running:
+            try:
+                if self.websocket:
+                    message = await self.websocket.recv()
+                    
+                    if isinstance(message, bytes) and len(message) > 0:
+                        msg_type = message[0]
+                        payload = message[1:]
+                        
+                        if msg_type == MSG_SPEAKER and self.speaker_stream:
+                            self.speaker_stream.write(payload)
+                            
+            except websockets.exceptions.ConnectionClosed:
+                logger.warning("Connection closed during receive")
+                break
+            except Exception as e:
+                logger.warning(f"Receive error: {e}")
+                await asyncio.sleep(0.1)
+    
+    async def _connect(self):
+        """Connect to WebSocket server with retry."""
+        while self._running:
+            try:
+                logger.info(f"Connecting to {self.server_url}...")
+                
+                self.websocket = await websockets.connect(
+                    self.server_url,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    close_timeout=5,
+                )
+                
+                logger.info("WebSocket connected!")
+                return True
+                
+            except Exception as e:
+                logger.warning(f"Connection failed: {e}, retrying in 2s...")
+                await asyncio.sleep(2)
         
-        if self.ha_client:
-            logger.info(f"  HA control: {self.ha_client.entity_id}")
-        else:
-            logger.info("  HA control: disabled (always streaming)")
-            self._streaming_enabled = True
-        
+        return False
+    
+    async def run(self):
+        """Main run loop with automatic reconnection."""
         self._running = True
         
         # Initialize PyAudio
         self.pa = pyaudio.PyAudio()
-        self._log_audio_devices()
+        
+        self.mic_stream = self.pa.open(
+            input=True,
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=SAMPLE_RATE,
+            frames_per_buffer=CHUNK_SIZE,
+        )
+        
+        self.speaker_stream = self.pa.open(
+            output=True,
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=SAMPLE_RATE,
+            frames_per_buffer=CHUNK_SIZE,
+        )
         
         # Start HA monitor if configured
         if self.ha_client:
-            self._start_ha_monitor()
+            asyncio.create_task(self._ha_monitor())
+        else:
+            self._streaming_enabled = True
         
-        # Start speaker listener (persistent connection)
-        self._start_speaker_listener()
+        logger.info("Audio streamer running...")
         
-        # Start mic sender (persistent connection)
-        self._start_mic_sender()
-        
-        logger.info("Audio streamer running. Press Ctrl+C to stop.")
-    
-    def _log_audio_devices(self):
-        """Log available audio devices."""
-        logger.info("Available audio devices:")
-        for i in range(self.pa.get_device_count()):
-            info = self.pa.get_device_info_by_index(i)
-            direction = []
-            if info['maxInputChannels'] > 0:
-                direction.append("IN")
-            if info['maxOutputChannels'] > 0:
-                direction.append("OUT")
-            logger.info(f"  [{i}] {info['name']} ({'/'.join(direction)})")
-    
-    def _start_ha_monitor(self):
-        """Start thread that monitors Home Assistant switch state."""
-        self._ha_thread = threading.Thread(target=self._ha_monitor_loop, daemon=True)
-        self._ha_thread.start()
-    
-    def _ha_monitor_loop(self):
-        """Monitor Home Assistant switch and update streaming state."""
+        # Main loop with reconnection
         while self._running:
             try:
-                new_state = self.ha_client.is_switch_on()
-                
-                with self._state_lock:
-                    if new_state != self._streaming_enabled:
-                        self._streaming_enabled = new_state
-                        if new_state:
-                            logger.info("HA switch ON - audio streaming resumed")
-                        else:
-                            logger.info("HA switch OFF - audio streaming paused (connection maintained)")
-                
-            except Exception as e:
-                logger.error(f"HA monitor error: {e}")
-                # Don't change streaming state on error - maintain current state
-            
-            time.sleep(HA_CHECK_INTERVAL)
-    
-    def _is_streaming_enabled(self) -> bool:
-        """Thread-safe check of streaming state."""
-        with self._state_lock:
-            return self._streaming_enabled
-    
-    def _start_speaker_listener(self):
-        """Start thread that listens for incoming TTS audio."""
-        self._speaker_thread = threading.Thread(target=self._speaker_loop, daemon=True)
-        self._speaker_thread.start()
-    
-    def _speaker_loop(self):
-        """Maintain persistent speaker connection, always receive and play audio."""
-        while self._running:
-            try:
-                # Create server socket
-                self.speaker_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.speaker_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                self.speaker_server.bind(("0.0.0.0", self.speaker_port))
-                self.speaker_server.listen(1)
-                self.speaker_server.settimeout(1.0)
-                
-                logger.info(f"Speaker listening on port {self.speaker_port}...")
-                
-                # Wait for server to connect
-                while self._running:
-                    try:
-                        self.speaker_conn, addr = self.speaker_server.accept()
-                        logger.info(f"Speaker connected from {addr}")
-                        break
-                    except socket.timeout:
-                        continue
-                
-                if not self._running:
-                    break
-                
-                # Open speaker stream
-                self.speaker_stream = self.pa.open(
-                    output=True,
-                    format=FORMAT,
-                    channels=CHANNELS,
-                    rate=SAMPLE_RATE,
-                    frames_per_buffer=CHUNK_SIZE,
-                )
-                
-                # Always receive and play audio (server controls what it sends)
-                # Connection stays open regardless of HA switch state
-                while self._running:
-                    try:
-                        data = self.speaker_conn.recv(4096)
-                        if not data:
-                            logger.info("Speaker connection closed by server")
-                            break
-                        # Always play received audio - server decides what to send
-                        self.speaker_stream.write(data)
-                    except socket.timeout:
-                        continue
-                    except socket.error as e:
-                        logger.warning(f"Speaker socket error: {e}")
-                        break
-                
-            except Exception as e:
-                logger.error(f"Speaker error: {e}")
-            
-            finally:
-                self._cleanup_speaker()
-            
-            if self._running:
-                logger.info("Speaker reconnecting in 2s...")
-                time.sleep(2)
-    
-    def _cleanup_speaker(self):
-        """Clean up speaker resources."""
-        if self.speaker_stream:
-            try:
-                self.speaker_stream.stop_stream()
-                self.speaker_stream.close()
-            except:
-                pass
-            self.speaker_stream = None
-        if self.speaker_conn:
-            try:
-                self.speaker_conn.shutdown(socket.SHUT_RDWR)
-            except:
-                pass
-            try:
-                self.speaker_conn.close()
-            except:
-                pass
-            self.speaker_conn = None
-        if self.speaker_server:
-            try:
-                self.speaker_server.close()
-            except:
-                pass
-            self.speaker_server = None
-    
-    def _start_mic_sender(self):
-        """Start thread that sends microphone audio to server."""
-        self._mic_thread = threading.Thread(target=self._mic_loop, daemon=True)
-        self._mic_thread.start()
-    
-    def _mic_loop(self):
-        """Maintain persistent mic connection, send audio only when enabled."""
-        while self._running:
-            try:
-                # Connect to server
-                self.mic_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.mic_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                self.mic_socket.settimeout(10.0)
-                
-                logger.info(f"Mic connecting to {self.server_ip}:{self.mic_port}...")
-                self.mic_socket.connect((self.server_ip, self.mic_port))
-                self.mic_socket.settimeout(None)  # No timeout once connected
-                logger.info("Mic connected to server (persistent connection)")
-                
-                # Open mic stream
-                self.mic_stream = self.pa.open(
-                    input=True,
-                    format=FORMAT,
-                    channels=CHANNELS,
-                    rate=SAMPLE_RATE,
-                    frames_per_buffer=CHUNK_SIZE,
-                )
-                
-                # Persistent connection loop
-                while self._running:
-                    try:
-                        # Always read from mic to keep buffer clear
-                        data = self.mic_stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                if await self._connect():
+                    # Run send and receive concurrently
+                    send_task = asyncio.create_task(self._send_audio())
+                    recv_task = asyncio.create_task(self._receive_audio())
+                    
+                    # Wait for either to complete (usually due to disconnect)
+                    done, pending = await asyncio.wait(
+                        [send_task, recv_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    
+                    # Cancel the other task
+                    for task in pending:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                    
+                    # Close websocket
+                    if self.websocket:
+                        await self.websocket.close()
+                        self.websocket = None
+                    
+                    if self._running:
+                        logger.info("Disconnected, reconnecting in 2s...")
+                        await asyncio.sleep(2)
                         
-                        # Only send if streaming is enabled
-                        if self._is_streaming_enabled():
-                            self.mic_socket.sendall(data)
-                        # else: discard audio data but keep connection alive
-                        
-                    except socket.error as e:
-                        logger.warning(f"Mic socket error: {e}")
-                        break
-                    except IOError as e:
-                        logger.warning(f"Mic read error: {e}")
-                        break
-                
-            except socket.timeout:
-                logger.warning("Mic connection timeout")
-            except ConnectionRefusedError:
-                logger.warning(f"Mic connection refused - is server running?")
             except Exception as e:
-                logger.error(f"Mic error: {e}")
-            
-            finally:
-                self._cleanup_mic()
-            
-            if self._running:
-                logger.info("Mic reconnecting in 2s...")
-                time.sleep(2)
-    
-    def _cleanup_mic(self):
-        """Clean up mic resources."""
-        if self.mic_stream:
-            try:
-                self.mic_stream.stop_stream()
-                self.mic_stream.close()
-            except:
-                pass
-            self.mic_stream = None
-        if self.mic_socket:
-            try:
-                self.mic_socket.shutdown(socket.SHUT_RDWR)
-            except:
-                pass
-            try:
-                self.mic_socket.close()
-            except:
-                pass
-            self.mic_socket = None
-    
-    def stop(self):
-        """Stop audio streaming."""
-        logger.info("Stopping audio streamer...")
-        self._running = False
-        
-        # Wait for threads
-        if self._mic_thread:
-            self._mic_thread.join(timeout=3)
-        if self._speaker_thread:
-            self._speaker_thread.join(timeout=3)
-        if self._ha_thread:
-            self._ha_thread.join(timeout=3)
+                logger.error(f"Run loop error: {e}")
+                await asyncio.sleep(2)
         
         # Cleanup
-        self._cleanup_mic()
-        self._cleanup_speaker()
-        
+        self._cleanup()
+    
+    def _cleanup(self):
+        """Clean up resources."""
+        if self.mic_stream:
+            self.mic_stream.stop_stream()
+            self.mic_stream.close()
+        if self.speaker_stream:
+            self.speaker_stream.stop_stream()
+            self.speaker_stream.close()
         if self.pa:
             self.pa.terminate()
-        
         logger.info("Audio streamer stopped")
     
-    def wait(self):
-        """Wait for threads to finish."""
-        try:
-            while self._running:
-                time.sleep(0.5)
-        except KeyboardInterrupt:
-            pass
+    def stop(self):
+        """Stop the streamer."""
+        self._running = False
+
+
+async def main_async(server_url: str, ha_client: HomeAssistantClient | None):
+    streamer = WebSocketAudioStreamer(server_url, ha_client)
+    
+    # Handle shutdown
+    loop = asyncio.get_event_loop()
+    
+    def signal_handler():
+        streamer.stop()
+    
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, signal_handler)
+    
+    await streamer.run()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HomeGPT Pi Audio Streamer")
-    parser.add_argument("--server", "-s", help="Server IP address")
-    parser.add_argument("--mic-port", "-m", type=int, help="Mic port")
-    parser.add_argument("--speaker-port", "-p", type=int, help="Speaker port")
+    parser = argparse.ArgumentParser(description="HomeGPT Pi Audio Streamer (WebSocket)")
+    parser.add_argument("--server", "-s", help="WebSocket server URL (e.g., ws://192.168.1.100:8765)")
     parser.add_argument("--ha-url", help="Home Assistant URL")
-    parser.add_argument("--ha-token", help="Home Assistant long-lived access token")
+    parser.add_argument("--ha-token", help="Home Assistant token")
     parser.add_argument("--ha-entity", help="HA entity ID")
     args = parser.parse_args()
     
-    # Load from args, then env vars, then defaults
-    server_ip = args.server or os.environ.get("SERVER_IP")
-    mic_port = args.mic_port or int(os.environ.get("MIC_PORT", "4712"))
-    speaker_port = args.speaker_port or int(os.environ.get("SPEAKER_PORT", "4713"))
+    server_ip = os.environ.get("SERVER_IP")
+    server_port = os.environ.get("WS_PORT", "8765")
+    server_url = args.server or os.environ.get("WS_SERVER_URL") or f"ws://{server_ip}:{server_port}"
+    
+    if not server_url or server_url == f"ws://None:{server_port}":
+        logger.error("Server URL required. Set SERVER_IP or WS_SERVER_URL in .env or use --server")
+        sys.exit(1)
+    
     ha_url = args.ha_url or os.environ.get("HOMEASSISTANT_URL")
     ha_token = args.ha_token or os.environ.get("HOMEASSISTANT_TOKEN")
     ha_entity = args.ha_entity or os.environ.get("HA_ENTITY", "input_boolean.homegpt")
     
-    if not server_ip:
-        logger.error("Server IP required. Set SERVER_IP in .env or use --server")
-        sys.exit(1)
-    
-    # Create HA client if configured
     ha_client = None
     if ha_url and ha_token:
         ha_client = HomeAssistantClient(ha_url, ha_token, ha_entity)
-        logger.info(f"Home Assistant control enabled: {ha_url}")
-    else:
-        logger.warning("No HA credentials provided - streaming will always be enabled")
+        logger.info(f"Home Assistant control enabled")
     
-    streamer = AudioStreamer(
-        server_ip=server_ip,
-        mic_port=mic_port,
-        speaker_port=speaker_port,
-        ha_client=ha_client,
-    )
+    logger.info(f"Starting WebSocket audio streamer")
+    logger.info(f"  Server: {server_url}")
     
-    # Handle Ctrl+C
-    def signal_handler(sig, frame):
-        streamer.stop()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    streamer.start()
-    streamer.wait()
+    asyncio.run(main_async(server_url, ha_client))
 
 
 if __name__ == "__main__":
