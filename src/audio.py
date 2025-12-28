@@ -158,23 +158,26 @@ class RemoteAudio:
     
     async def _process_write_queue(self):
         """Process queued audio for writing."""
+        logger.info("Write queue processor started")  # ADD THIS
         while self._running:
             try:
-                # Wait for audio data
                 audio = await asyncio.wait_for(self._write_queue.get(), timeout=1.0)
                 
-                # Send it
+                logger.info(f"Dequeued {len(audio)} bytes to send")  # ADD THIS
+                
                 if self._client_ws is not None:
                     try:
                         message = bytes([self.MSG_SPEAKER]) + audio
                         await self._client_ws.send(message)
+                        logger.info(f"Sent {len(message)} bytes to client")  # ADD THIS
                     except websockets.exceptions.ConnectionClosed:
                         logger.warning("Cannot write - client disconnected")
                     except Exception as e:
                         logger.warning(f"Write error: {e}")
+                else:
+                    logger.warning("No client connected, dropping audio")  # ADD THIS
                         
             except asyncio.TimeoutError:
-                # No data, just continue
                 continue
             except Exception as e:
                 logger.warning(f"Write queue error: {e}")
@@ -255,14 +258,18 @@ class RemoteAudio:
             logger.warning("Cannot write - client disconnected")
         except Exception as e:
             logger.warning(f"Write error: {e}")
-    
+
     def write_sync(self, audio: bytes) -> None:
         """Synchronous write wrapper for TTS compatibility."""
-        if self._client_ws is None or self._loop is None:
+        if self._client_ws is None:
+            logger.warning("write_sync: No client connected")  # ADD THIS
+            return
+        if self._loop is None:
+            logger.warning("write_sync: No event loop")  # ADD THIS
             return
         
         try:
-            # Put audio in the queue - the async task will send it
+            logger.info(f"write_sync: Queueing {len(audio)} bytes")  # ADD THIS
             self._loop.call_soon_threadsafe(
                 self._write_queue.put_nowait, audio
             )

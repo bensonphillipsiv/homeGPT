@@ -158,24 +158,28 @@ class WebSocketAudioStreamer:
                 try:
                     message = await asyncio.wait_for(
                         self.websocket.recv(),
-                        timeout=30.0  # Timeout to check if still running
+                        timeout=30.0
                     )
                     
                     if isinstance(message, bytes) and len(message) > 0:
                         msg_type = message[0]
                         payload = message[1:]
                         
+                        logger.info(f"Received message type={msg_type}, payload_len={len(payload)}")  # ADD THIS
+                        
                         if msg_type == MSG_SPEAKER and self.speaker_stream:
+                            logger.info(f"Playing {len(payload)} bytes of audio")  # ADD THIS
                             self.speaker_stream.write(payload)
+                    else:
+                        logger.warning(f"Received non-bytes or empty: {type(message)}")  # ADD THIS
                             
                 except asyncio.TimeoutError:
-                    # Just a timeout, check if still running and continue
                     continue
                 except websockets.exceptions.ConnectionClosed as e:
                     logger.warning(f"Receive: Connection closed: {e}")
                     break
                 except Exception as e:
-                    logger.error(f"Receive error: {e}")
+                    logger.error(f"Receive error: {e}", exc_info=True)  # ADD exc_info
                     await asyncio.sleep(0.1)
         finally:
             logger.info("Receive audio task ended")
