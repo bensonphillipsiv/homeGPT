@@ -127,11 +127,18 @@ class RemoteAudio:
         self._running = False
         self._handler_task = None
         self._loop = None
+        
+        # Queue for synchronous writes
+        self._write_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._write_task = None
     
     async def connect(self):
         """Start WebSocket server and wait for client connection."""
         self._running = True
-        self._loop = asyncio.get_event_loop()
+        self._loop = asyncio.get_running_loop()
+        
+        # Start the write queue processor
+        self._write_task = asyncio.create_task(self._process_write_queue())
         
         self._server = await serve(
             self._handle_client,
@@ -148,6 +155,29 @@ class RemoteAudio:
         await self._connected.wait()
         
         logger.info("WebSocket audio connected")
+    
+    async def _process_write_queue(self):
+        """Process queued audio for writing."""
+        while self._running:
+            try:
+                # Wait for audio data
+                audio = await asyncio.wait_for(self._write_queue.get(), timeout=1.0)
+                
+                # Send it
+                if self._client_ws is not None:
+                    try:
+                        message = bytes([self.MSG_SPEAKER]) + audio
+                        await self._client_ws.send(message)
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.warning("Cannot write - client disconnected")
+                    except Exception as e:
+                        logger.warning(f"Write error: {e}")
+                        
+            except asyncio.TimeoutError:
+                # No data, just continue
+                continue
+            except Exception as e:
+                logger.warning(f"Write queue error: {e}")
     
     async def _handle_client(self, websocket):
         """Handle incoming WebSocket connection."""
@@ -191,11 +221,6 @@ class RemoteAudio:
                     pass
             self._read_buffer = b""
             logger.info(f"Client {client_addr} cleaned up, waiting for reconnection...")
-            
-            # Wait for reconnection if still running
-            if self._running:
-                logger.info("Waiting for Pi to reconnect...")
-                await self._connected.wait()
     
     async def read(self) -> bytes:
         """Read one frame of audio from the client."""
@@ -237,16 +262,24 @@ class RemoteAudio:
             return
         
         try:
-            # Schedule the async write from sync context
-            future = asyncio.run_coroutine_threadsafe(self.write(audio), self._loop)
-            # Wait for completion with timeout
-            future.result(timeout=1.0)
+            # Put audio in the queue - the async task will send it
+            self._loop.call_soon_threadsafe(
+                self._write_queue.put_nowait, audio
+            )
         except Exception as e:
-            logger.warning(f"Sync write failed: {e}")
+            logger.warning(f"Sync write queue failed: {e}")
     
     async def close(self):
         """Close the server."""
         self._running = False
+        
+        if self._write_task:
+            self._write_task.cancel()
+            try:
+                await self._write_task
+            except asyncio.CancelledError:
+                pass
+        
         if self._client_ws:
             try:
                 await self._client_ws.close()

@@ -90,7 +90,7 @@ class WebSocketAudioStreamer:
         self.websocket = None
         
         self._running = False
-        self._streaming_enabled = False
+        self._streaming_enabled = True  # Default to enabled
         self._state_lock = threading.Lock()
         
         # Silence frame for when streaming is disabled
@@ -122,33 +122,44 @@ class WebSocketAudioStreamer:
     
     async def _send_audio(self):
         """Read from mic and send to server."""
-        while self._running:
-            try:
-                if self.mic_stream and self.websocket:
-                    # Always read to keep buffer clear
-                    data = self.mic_stream.read(CHUNK_SIZE, exception_on_overflow=False)
-                    
-                    if self._is_streaming_enabled():
-                        # Send real audio
-                        message = bytes([MSG_MIC]) + data
+        logger.info("Send audio task started")
+        try:
+            while self._running and self.websocket:
+                try:
+                    if self.mic_stream:
+                        # Always read to keep buffer clear
+                        data = self.mic_stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                        
+                        if self._is_streaming_enabled():
+                            # Send real audio
+                            message = bytes([MSG_MIC]) + data
+                        else:
+                            # Send silence
+                            message = bytes([MSG_MIC]) + self._silence_frame
+                        
+                        await self.websocket.send(message)
                     else:
-                        # Send silence
-                        message = bytes([MSG_MIC]) + self._silence_frame
-                    
-                    await self.websocket.send(message)
-                else:
-                    await asyncio.sleep(0.01)
-                    
-            except Exception as e:
-                logger.warning(f"Send error: {e}")
-                await asyncio.sleep(0.1)
+                        await asyncio.sleep(0.01)
+                        
+                except websockets.exceptions.ConnectionClosed as e:
+                    logger.warning(f"Send: Connection closed: {e}")
+                    break
+                except Exception as e:
+                    logger.error(f"Send error: {e}")
+                    await asyncio.sleep(0.1)
+        finally:
+            logger.info("Send audio task ended")
     
     async def _receive_audio(self):
         """Receive audio from server and play."""
-        while self._running:
-            try:
-                if self.websocket:
-                    message = await self.websocket.recv()
+        logger.info("Receive audio task started")
+        try:
+            while self._running and self.websocket:
+                try:
+                    message = await asyncio.wait_for(
+                        self.websocket.recv(),
+                        timeout=30.0  # Timeout to check if still running
+                    )
                     
                     if isinstance(message, bytes) and len(message) > 0:
                         msg_type = message[0]
@@ -157,42 +168,41 @@ class WebSocketAudioStreamer:
                         if msg_type == MSG_SPEAKER and self.speaker_stream:
                             self.speaker_stream.write(payload)
                             
-            except websockets.exceptions.ConnectionClosed:
-                logger.warning("Connection closed during receive")
-                break
-            except Exception as e:
-                logger.warning(f"Receive error: {e}")
-                await asyncio.sleep(0.1)
+                except asyncio.TimeoutError:
+                    # Just a timeout, check if still running and continue
+                    continue
+                except websockets.exceptions.ConnectionClosed as e:
+                    logger.warning(f"Receive: Connection closed: {e}")
+                    break
+                except Exception as e:
+                    logger.error(f"Receive error: {e}")
+                    await asyncio.sleep(0.1)
+        finally:
+            logger.info("Receive audio task ended")
     
-    async def _connect(self):
-        """Connect to WebSocket server with retry."""
-        while self._running:
+    def _init_audio(self):
+        """Initialize PyAudio streams."""
+        logger.info("Initializing audio...")
+        
+        if self.pa is None:
+            self.pa = pyaudio.PyAudio()
+        
+        # Close existing streams if any
+        if self.mic_stream:
             try:
-                logger.info(f"Connecting to {self.server_url}...")
-                
-                self.websocket = await websockets.connect(
-                    self.server_url,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    close_timeout=5,
-                )
-                
-                logger.info("WebSocket connected!")
-                return True
-                
-            except Exception as e:
-                logger.warning(f"Connection failed: {e}, retrying in 2s...")
-                await asyncio.sleep(2)
+                self.mic_stream.stop_stream()
+                self.mic_stream.close()
+            except:
+                pass
         
-        return False
-    
-    async def run(self):
-        """Main run loop with automatic reconnection."""
-        self._running = True
+        if self.speaker_stream:
+            try:
+                self.speaker_stream.stop_stream()
+                self.speaker_stream.close()
+            except:
+                pass
         
-        # Initialize PyAudio
-        self.pa = pyaudio.PyAudio()
-        
+        # Open new streams
         self.mic_stream = self.pa.open(
             input=True,
             format=FORMAT,
@@ -200,6 +210,7 @@ class WebSocketAudioStreamer:
             rate=SAMPLE_RATE,
             frames_per_buffer=CHUNK_SIZE,
         )
+        logger.info("Mic stream opened")
         
         self.speaker_stream = self.pa.open(
             output=True,
@@ -208,10 +219,38 @@ class WebSocketAudioStreamer:
             rate=SAMPLE_RATE,
             frames_per_buffer=CHUNK_SIZE,
         )
+        logger.info("Speaker stream opened")
+    
+    async def _connect(self):
+        """Connect to WebSocket server."""
+        try:
+            logger.info(f"Connecting to {self.server_url}...")
+            
+            self.websocket = await websockets.connect(
+                self.server_url,
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=5,
+            )
+            
+            logger.info("WebSocket connected!")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Connection failed: {e}")
+            return False
+    
+    async def run(self):
+        """Main run loop with automatic reconnection."""
+        self._running = True
+        
+        # Initialize audio once
+        self._init_audio()
         
         # Start HA monitor if configured
+        ha_task = None
         if self.ha_client:
-            asyncio.create_task(self._ha_monitor())
+            ha_task = asyncio.create_task(self._ha_monitor())
         else:
             self._streaming_enabled = True
         
@@ -231,6 +270,11 @@ class WebSocketAudioStreamer:
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     
+                    # Log which task finished
+                    for task in done:
+                        if task.exception():
+                            logger.error(f"Task failed with: {task.exception()}")
+                    
                     # Cancel the other task
                     for task in pending:
                         task.cancel()
@@ -241,34 +285,59 @@ class WebSocketAudioStreamer:
                     
                     # Close websocket
                     if self.websocket:
-                        await self.websocket.close()
+                        try:
+                            await self.websocket.close()
+                        except:
+                            pass
                         self.websocket = None
-                    
-                    if self._running:
-                        logger.info("Disconnected, reconnecting in 2s...")
-                        await asyncio.sleep(2)
+                
+                if self._running:
+                    logger.info("Disconnected, reconnecting in 2s...")
+                    await asyncio.sleep(2)
                         
             except Exception as e:
                 logger.error(f"Run loop error: {e}")
                 await asyncio.sleep(2)
+        
+        # Cancel HA monitor
+        if ha_task:
+            ha_task.cancel()
+            try:
+                await ha_task
+            except asyncio.CancelledError:
+                pass
         
         # Cleanup
         self._cleanup()
     
     def _cleanup(self):
         """Clean up resources."""
+        logger.info("Cleaning up...")
         if self.mic_stream:
-            self.mic_stream.stop_stream()
-            self.mic_stream.close()
+            try:
+                self.mic_stream.stop_stream()
+                self.mic_stream.close()
+            except:
+                pass
+            self.mic_stream = None
         if self.speaker_stream:
-            self.speaker_stream.stop_stream()
-            self.speaker_stream.close()
+            try:
+                self.speaker_stream.stop_stream()
+                self.speaker_stream.close()
+            except:
+                pass
+            self.speaker_stream = None
         if self.pa:
-            self.pa.terminate()
+            try:
+                self.pa.terminate()
+            except:
+                pass
+            self.pa = None
         logger.info("Audio streamer stopped")
     
     def stop(self):
         """Stop the streamer."""
+        logger.info("Stop requested")
         self._running = False
 
 
@@ -279,6 +348,7 @@ async def main_async(server_url: str, ha_client: HomeAssistantClient | None):
     loop = asyncio.get_event_loop()
     
     def signal_handler():
+        logger.info("Signal received, stopping...")
         streamer.stop()
     
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -297,9 +367,9 @@ def main():
     
     server_ip = os.environ.get("SERVER_IP")
     server_port = os.environ.get("WS_PORT", "8765")
-    server_url = args.server or os.environ.get("WS_SERVER_URL") or f"ws://{server_ip}:{server_port}"
+    server_url = args.server or os.environ.get("WS_SERVER_URL") or (f"ws://{server_ip}:{server_port}" if server_ip else None)
     
-    if not server_url or server_url == f"ws://None:{server_port}":
+    if not server_url:
         logger.error("Server URL required. Set SERVER_IP or WS_SERVER_URL in .env or use --server")
         sys.exit(1)
     
@@ -311,6 +381,8 @@ def main():
     if ha_url and ha_token:
         ha_client = HomeAssistantClient(ha_url, ha_token, ha_entity)
         logger.info(f"Home Assistant control enabled")
+    else:
+        logger.info("No HA credentials - always streaming")
     
     logger.info(f"Starting WebSocket audio streamer")
     logger.info(f"  Server: {server_url}")
