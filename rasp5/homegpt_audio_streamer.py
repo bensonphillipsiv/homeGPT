@@ -419,8 +419,7 @@ def main():
     args = parser.parse_args()
     
     server_ip = os.environ.get("SERVER_IP")
-    server_port = os.environ.get("WS_PORT", "8765")
-    server_url = args.server or os.environ.get("WS_SERVER_URL") or (f"ws://{server_ip}:{server_port}" if server_ip else None)
+    server_url = args.server or os.environ.get("WS_SERVER_URL") or (f"ws://{server_ip}" if server_ip else None)
     
     if not server_url:
         logger.error("Server URL required")
