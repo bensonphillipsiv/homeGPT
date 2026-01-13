@@ -1,8 +1,8 @@
 #!/bin/bash
-# install_service.sh
+# setup_service.sh
 # Installs the HomeGPT audio streamer as a systemd service
 #
-# Usage: sudo ./install_service.sh
+# Usage: sudo ./setup_service.sh
 
 set -e
 

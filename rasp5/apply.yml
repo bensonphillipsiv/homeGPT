@@ -1,0 +1,41 @@
+---
+- name: Deploy HomeGPT Audio Streamer to Raspberry Pi
+  hosts: raspberry_pi
+  become: false
+  vars:
+    remote_dir: /tmp/homegpt-deploy
+
+  tasks:
+    - name: Create remote directory
+      ansible.builtin.file:
+        path: "{{ remote_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Copy source files
+      ansible.builtin.copy:
+        src: apply_src/
+        dest: "{{ remote_dir }}/"
+        mode: preserve
+
+    - name: Create .env file
+      ansible.builtin.copy:
+        dest: "{{ remote_dir }}/.env"
+        mode: '0600'
+        content: |
+          SERVER_IP={{ lookup('env', 'SERVER_URL') }}
+          HOMEASSISTANT_URL={{ lookup('env', 'HOMEASSISTANT_URL') }}
+          HOMEASSISTANT_TOKEN={{ lookup('env', 'HOMEASSISTANT_TOKEN') }}
+
+    - name: Add server to /etc/hosts
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ lookup('env', 'SERVER_IP') }}  {{ lookup('env', 'SERVER_URL') }}"
+        state: present
+      become: true
+
+    - name: Run setup_service.sh
+      ansible.builtin.command:
+        cmd: ./setup_service.sh
+        chdir: "{{ remote_dir }}"
+      become: true

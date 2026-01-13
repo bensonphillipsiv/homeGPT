@@ -1,0 +1,26 @@
+---
+- name: Reconcile HomeGPT Audio Streamer Service
+  hosts: raspberry_pi
+  become: true
+
+  vars:
+    service_name: homegpt-audio-streamer
+    expected_hosts_entry: "{{ lookup('env', 'SERVER_IP') }}  {{ lookup('env', 'SERVER_URL') }}"
+
+  tasks:
+    - name: Ensure hosts entry is present
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ expected_hosts_entry }}"
+        state: present
+
+    - name: Check if service is running
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        state: started
+        enabled: true
+      register: service_status
+
+    - name: Display service status
+      ansible.builtin.debug:
+        msg: "Service {{ service_name }} is {{ service_status.status.ActiveState }}"
