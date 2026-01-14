@@ -1,0 +1,10 @@
+all:
+  children:
+    raspberry_pi:
+      hosts:
+        pi-host:
+          ansible_host: "{{ lookup('env', 'RASP5_HOST') }}"
+      vars:
+        ansible_user: "{{ lookup('env', 'RASP5_USER') }}"
+        ansible_password: "{{ lookup('env', 'RASP5_PASS') }}"
+        ansible_become_password: "{{ lookup('env', 'RASP5_PASS') }}"
