@@ -1,4 +1,17 @@
 ---
+- name: Setup Raspberry Pi target
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Add raspberry pi host
+      ansible.builtin.add_host:
+        name: rasp5
+        groups: raspberry_pi
+        ansible_host: "{{ lookup('env', 'RASP5_HOST') }}"
+        ansible_user: "{{ lookup('env', 'RASP5_USER') }}"
+        ansible_password: "{{ lookup('env', 'RASP5_PASS') }}"
+        ansible_become_password: "{{ lookup('env', 'RASP5_PASS') }}"
+
 - name: Reconcile HomeGPT Audio Streamer Service
   hosts: raspberry_pi
   become: true
