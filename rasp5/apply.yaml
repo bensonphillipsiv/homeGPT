@@ -1,26 +1,10 @@
 ---
-# PLAY 1: Dynamically create the inventory from Environment Variables
-- name: Setup Dynamic Inventory
-  hosts: localhost
-  connection: local
-  gather_facts: false
-  tasks:
-    - name: Add remote Pi to execution group
-      add_host:
-        name: "{{ lookup('env', 'RASP5_HOST') }}"
-        groups: remote_pi
-        ansible_user: "{{ lookup('env', 'RASP5_USER') }}"
-        ansible_password: "{{ lookup('env', 'RASP5_PASS') }}"
-        ansible_become_password: "{{ lookup('env', 'RASP5_PASS') }}"
-        ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
-
-# PLAY 2: Run the deployment on the remote Pi
-- name: Deploy HomeGPT Audio Streamer
-  hosts: remote_pi
-  gather_facts: false
+- name: Deploy HomeGPT Audio Streamer to Raspberry Pi
+  hosts: raspberry_pi
+  become: false
   vars:
     remote_dir: /tmp/homegpt-deploy
-  
+
   tasks:
     - name: Create remote directory
       ansible.builtin.file:
@@ -39,7 +23,7 @@
         dest: "{{ remote_dir }}/.env"
         mode: '0600'
         content: |
-          SERVER_IP={{ lookup('env', 'SERVER_IP') }}
+          SERVER_IP={{ lookup('env', 'SERVER_URL') }}
           HOMEASSISTANT_URL={{ lookup('env', 'HOMEASSISTANT_URL') }}
           HOMEASSISTANT_TOKEN={{ lookup('env', 'HOMEASSISTANT_TOKEN') }}
 
