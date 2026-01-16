@@ -34,6 +34,11 @@
         state: present
       become: true
 
+    - name: Make setup_service.sh executable
+      ansible.builtin.file:
+        path: "{{ remote_dir }}/setup_service.sh"
+        mode: '0755'
+
     - name: Run setup_service.sh
       ansible.builtin.command:
         cmd: ./setup_service.sh
